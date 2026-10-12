@@ -45,6 +45,28 @@ def test_loaded_dead_unit_requires_successful_stop(monkeypatch):
     assert guard.verified_stop(["systemctl"], "collector.service")["verifiedStopped"] is True
 
 
+def test_active_or_nonzero_pid_is_not_verified(monkeypatch):
+    guard = module()
+
+    def run(command, **_):
+        if "stop" in command:
+            return Result(0)
+        return Result(0, "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=42\n")
+
+    monkeypatch.setattr(guard.subprocess, "run", run)
+    assert guard.verified_stop(["systemctl"], "collector.service")["verifiedStopped"] is False
+
+
+def test_failed_systemctl_show_is_not_verified(monkeypatch):
+    guard = module()
+
+    def run(command, **_):
+        return Result(0) if "stop" in command else Result(1, stderr="dbus unavailable")
+
+    monkeypatch.setattr(guard.subprocess, "run", run)
+    assert guard.verified_stop(["systemctl"], "collector.service")["verifiedStopped"] is False
+
+
 def test_statvfs_failure_still_reaches_collector_stop(monkeypatch, tmp_path):
     guard = module()
     calls, writes = [], []
