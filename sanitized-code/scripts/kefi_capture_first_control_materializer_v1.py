@@ -37,6 +37,52 @@ def atomic_json(path: Path, payload: object) -> None:
     os.replace(temporary, path)
 
 
+def source_partition_refs(window: Path) -> list[dict[str, str]]:
+    """Bind a derived window to immutable partition manifests without copying raw."""
+    references: list[dict[str, str]] = []
+    partition_root = window / "partitions"
+    for manifest_path in sorted(partition_root.glob("**/manifest.json")):
+        manifest = json.loads(manifest_path.read_text())
+        compressed_sha256 = str(manifest.get("compressedSha256", ""))
+        if not compressed_sha256:
+            raise RuntimeError(f"FAIL_CLOSED: partition lacks compressed hash {manifest_path}")
+        evidence = manifest_path.parent / "evidence.frames.zst"
+        if not evidence.is_file():
+            raise RuntimeError(f"FAIL_CLOSED: partition evidence missing {manifest_path.parent}")
+        references.append({
+            "relative_manifest_path": manifest_path.relative_to(window).as_posix(),
+            "manifest_sha256": sha256(manifest_path),
+            "compressed_sha256": compressed_sha256,
+        })
+    if not references:
+        raise RuntimeError(f"FAIL_CLOSED: no source partition manifests {window}")
+    return references
+
+
+def decoder_identity(decoder: Path) -> dict[str, str]:
+    if not decoder.is_file():
+        raise RuntimeError(f"FAIL_CLOSED: decoder missing {decoder}")
+    return {"decoder_path": str(decoder), "decoder_sha256": sha256(decoder)}
+
+
+def verified_processed_receipt(out: Path, window_id: str) -> bool:
+    """Verify a remembered cursor item before trusting it after a restart."""
+    receipt_path = out / "receipts" / f"{window_id}.json"
+    if not receipt_path.is_file():
+        return False
+    try:
+        receipt = json.loads(receipt_path.read_text())
+        if receipt.get("window_id") != window_id:
+            return False
+        rows_path = Path(str(receipt["market_rows_path"]))
+        expected_parent = (out / "market-rows").resolve()
+        if expected_parent not in rows_path.resolve().parents:
+            return False
+        return rows_path.is_file() and sha256(rows_path) == receipt.get("market_rows_sha256")
+    except (KeyError, OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def complete_signatures(root: Path) -> set[str]:
     result: set[str] = set()
     for receipt in (root / "promotion-results").glob("*.json"):
@@ -275,6 +321,13 @@ def main() -> None:
         eligible = windows(args.root, completed)
         if args.not_before_window_id:
             eligible = [entry for entry in eligible if entry[0] >= args.not_before_window_id]
+    corrupt_processed = [entry[0] for entry in eligible if entry[0] in processed
+                         and not verified_processed_receipt(args.out, entry[0])]
+    if corrupt_processed:
+        raise RuntimeError(
+            "FAIL_CLOSED: processed window receipt/content verification failed: "
+            + ",".join(corrupt_processed)
+        )
     # Filter the durable cursor before applying the bounded-work limit.  The
     # previous ordering repeatedly selected the oldest already-processed
     # window, then performed zero useful work forever when --max-windows=1.
@@ -296,6 +349,8 @@ def main() -> None:
             "candidate_signatures": sorted(str(c["signature"]) for c in manifest["candidates"]),
             "market_rows_path": str(destination),
             "market_rows_sha256": sha256(destination),
+            "source_partition_refs": source_partition_refs(window),
+            "decoder": decoder_identity(args.decoder),
             "decoder_summary": summary,
             "outcome_blind": True,
             "pnl_accessed": False,

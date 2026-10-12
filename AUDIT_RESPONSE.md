@@ -1,5 +1,10 @@
 # Response to Independent Audit
 
+> Superseded for live remediation status by
+> [AUDIT_IMPLEMENTATION_STATUS.md](AUDIT_IMPLEMENTATION_STATUS.md). This file
+> records the initial package reconciliation and must not be read as a claim
+> that all audit blockers are closed.
+
 ## Verified Package Corrections
 
 The first public packet had packaging drift: the supplied tests expected scripts
@@ -9,7 +14,8 @@ VPS production sources are now included at the expected paths.
 
 Production source hashes at the time of this update:
 
-- Materializer: `ddb7a576f4b5b09a8ca63282e6767561a953eff6a82b76e1edf24f2185d5e27a`
+- Materializer at the first packet correction:
+  `ddb7a576f4b5b09a8ca63282e6767561a953eff6a82b76e1edf24f2185d5e27a`
 - Evidence catalog: `15267094610fdc5b5d285244a5cb684372db4f932bc54bbc748ffec6b2a99917`
 - Capacity guard: `8f6570f9429e878322952aeab6a3dd311d4219ee4d3df3a7b779b9c48bcc7e3a`
 
@@ -31,4 +37,7 @@ The independent audit correctly identified these remaining production blockers:
    existence of a `/mnt/...` path.
 
 No H3 paper boundary may be created until those mechanics are repaired and
-tested against the production source surface.
+tested against the production source surface. A later inactive materializer
+hardening deployment added receipt/content revalidation, decoder identity, and
+source-manifest bindings; the independent status ledger records its current
+hash and the remaining canonical-index/temporal-audit work.
