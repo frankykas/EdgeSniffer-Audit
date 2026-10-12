@@ -9,9 +9,9 @@ claim has been made and no H3 paper boundary may rely on it.
 
 ## Pre-H3 Mechanics Closure Update (2026-10-12T15:15Z)
 
-**H3 status: READY FOR INDEPENDENT SPECIFICATION AUDIT ONLY.**  No H3
-boundary, cohort, timer, paper result, or live-execution permission has been
-created.
+**Infrastructure status: READY FOR INDEPENDENT PRE-H3 SPECIFICATION AUDIT
+ONLY.  Scientific H3 status: NOT SPECIFIED / NOT STARTED.**  No H3 boundary,
+cohort, timer, paper result, or live-execution permission has been created.
 
 The following new evidence has been produced from one *post-repair* promoted
 window, under an isolated engineering-only `FUTURE_UNOPENED` registry epoch:
@@ -34,11 +34,13 @@ Authoritative live-proof artifacts on the VPS:
 - `.../mechanics-gate.json`
   `82e1fb6e0a15acf25b930ba7ee48adbf1932adaec997388b7bffdf4a21a84804`
 
-The only remaining pre-H3 action is independent review of the proposed H3
-specification.  The proposal is copied as
-`sanitized-code/KEFI_H3_PROPOSED_SPEC_FOR_INDEPENDENT_AUDIT.md`; its SHA-256
-is `77c974ebd9f80a4f499f8ba1a56cf9cb908841f7f7a6d782b610ceecb7c05952`.
-Approval is required before any new boundary is written.
+The former H3 proposal was correctly reclassified: it was an actionability
+qualification, not an answer to H1's economic failure.  The only immediate
+proposed study is now
+`sanitized-code/KEFI_PRE_H3_ACTIONABILITY_QUALIFICATION_V1_SPEC_FOR_INDEPENDENT_AUDIT.md`.
+It needs independent review before a **pre-H3 qualification** boundary is
+written.  A real H3 remains blocked pending separate offline discovery of one
+new post-H1 economic hypothesis and its own independent review.
 
 ## Current Safety State
 
@@ -186,21 +188,26 @@ complete.
 
 ### 9. Bounded H3 discovery tournament
 
-**Status: NOT STARTED.**
+**Status: NOT STARTED; STILL REQUIRED FOR A TRUE H3.**
 
 Preconditions: items 1, 5, 6, 7, and 8 must be verified. The tournament is
 limited to 24 complete configurations, uses purged chronological folds and
 pool/time clustering, and selects exactly one H3 by out-of-fold economic
 advantage over controls. Selection AUC is diagnostic, not the objective.
 
-### 10. Fresh H3 paper/control gate
+### 10. Pre-H3 qualification, then fresh H3 paper/control gate
 
-**Status: BLOCKED BY PRECONDITIONS.**
+**Status: PRE-H3 QUALIFICATION SPECIFICATION PROPOSED; TRUE H3 BLOCKED BY
+DISCOVERY.**
 
-It must start only after immutable H3 preregistration and a clean post-deploy
-boundary. Its minimum floor is 300 accepted events, 40 distinct pools/mints,
-8 chronological blocks, no pool above 10% of entries, plus the larger
-variance-based sample requirement. It is not an arbitrary 24-hour test.
+The proposed pre-H3 qualification has a fixed all-target denominator and a
+cluster-aware actionability endpoint. It cannot be renamed H3 or used for
+economic claims. A true H3 starts only after the tournament selects one novel
+post-H1 economic hypothesis, that hypothesis is preregistered, and a clean
+post-deploy boundary is independently approved. The pre-H3 representation
+floors are 300 targets, 40 pools/mints, 8 chronological blocks, no pool above
+10% of targets, and >=70% target control availability; they are not an
+arbitrary 24-hour test.
 
 ## Explicit Non-Claims
 
@@ -213,11 +220,10 @@ variance-based sample requirement. It is not an arbitrary 24-hour test.
 
 ## Immediate Build Order
 
-1. Write the epoch/quarantine registry and strict pre-H3 boundary guard.
-2. Complete truly incremental raw-event ingestion, prove equivalence/restart
-   behavior, and keep integrity scrubs off the hot append path.
-3. Run temporal/actionability plus AMM/paper-mechanics audit before freezing
-   feature/control tables.
-4. Generate canonical compact Parquet research tables and deterministic split/
-   control assignments from the audited raw event layer.
-5. Only then register the fixed, maximum-24 H3 discovery tournament.
+1. Independently audit `PRE_H3_ACTIONABILITY_QUALIFICATION_V1`; do not create
+   any boundary until approved.
+2. Run that qualification once, if approved, and report PASS / INCONCLUSIVE /
+   REJECT without PnL or strategy tuning.
+3. Generate compact research tables and execute the bounded offline discovery
+   protocol to select one genuinely post-H1 H3 economic hypothesis.
+4. Independently audit that separate H3 preregistration before its boundary.

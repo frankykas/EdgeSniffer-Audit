@@ -1,92 +1,39 @@
-# Proposed kEfi H3 Specification (Not Yet Frozen)
+# H3 Proposal Disposition
 
-Status: `PROPOSED_FOR_INDEPENDENT_AUDIT_ONLY`  
-This document creates no cohort, scientific boundary, timer, or result.
+Status: `SUPERSEDED_BEFORE_ANY_H3_BOUNDARY`
 
-## Question
+This document deliberately does **not** propose an H3 strategy cohort.  The
+previous draft was an actionability/mechanics study, not a test of a new
+post-H1 economic hypothesis.  Calling it H3 would have overstated what a
+positive result could establish.
 
-Does the already frozen **base pre-entry kEfi fingerprint** identify fresh,
-prospectively observable PumpSwap states that remain mechanically actionable
-after a conservative fixed delay, relative to deterministic contemporaneous
-non-match controls?
+## Why H3 Is Not Yet Specified
 
-This is an actionability/selection paper gate. It is not a profitability,
-live-trading, PnL, or execution claim.
+H1 was a one-shot fresh economic rejection of the broad base fingerprint:
+5,174 matched entries produced `-13.3939 SOL` and `PF 0.1548`, worse than its
+comparable controls (`-6.2433 SOL`, `PF 0.4066`).  It follows that selection
+discrimination alone is not the missing claim.  A new H3 strategy hypothesis
+must first be chosen from a sealed, outcome-blind-to-fresh-data offline
+discovery process and then independently reviewed.
 
-## Fixed Inputs
+The infrastructure is ready for that later study.  It is **not** permission to
+name or open H3 now.
 
-- Fingerprint: existing frozen strict pre-entry artifact with SHA-256
-  `db08899d92f4d69d8c0234cfff9cbd05bd27dfb1365aed88d08b85f88cfc1b4`.
-- No crowded-impulse overlay, refitting, feature selection, threshold tuning,
-  outcome-driven filtering, or model-family comparison.
-- New evidence only, beginning at a boundary created **after** this proposal is
-  independently approved. Historical, H1/H2/quarantined/operational, and
-  pre-boundary evidence are rejected by the epoch registry.
+## Immediate Proposed Study
 
-## Required Evidence Contract
+The only proposed fresh study is
+`PRE_H3_ACTIONABILITY_QUALIFICATION_V1`, defined in
+[KEFI_PRE_H3_ACTIONABILITY_QUALIFICATION_V1_SPEC_FOR_INDEPENDENT_AUDIT.md](KEFI_PRE_H3_ACTIONABILITY_QUALIFICATION_V1_SPEC_FOR_INDEPENDENT_AUDIT.md).
 
-Every considered row must have all of the following:
+It answers the limited question: whether the frozen base fingerprint's
+pre-entry matches are more likely than contemporaneous matched non-matches to
+remain completely observable and mechanically actionable after a fixed delay.
+It does not read PnL, infer fills, select a new strategy, or make an economic
+or live-trading claim.
 
-1. A single `FUTURE_UNOPENED` and `UNOPENED` registry epoch containing its
-   receipt timestamp, after the frozen boundary.
-2. `source_instance_id`, `continuity_epoch`,
-   `durable_output_sequence`, `event_index`, and source-frame SHA-256.
-3. A unique deterministic source order:
-   `(source_instance_id, continuity_epoch, durable_output_sequence,
-   event_index, source_frame_sha256)`.
-4. An exact instruction/event-validated PumpSwap transition.
-5. Canonical SOL quote layout, a non-SOL base mint, and reconstructable raw
-   pre-state. Unsupported layouts, missing state, duplicate order, source
-   changes, and incomplete horizons are non-tradeable and excluded with a
-   stable reason. They are never imputed.
+## H3 Prerequisite After This Study
 
-## Paper Mechanics
-
-- Availability clock: `received_at_unix_ns`.
-- Fixed entry delay: `1,000,000,000 ns` (1 second), selected as a conservative
-  operational delay rather than from outcome performance.
-- Paper entry state: first supported same-source-instance/same-epoch state for
-  the selected `(pool, mint)` at or after that delay.
-- Warm-up: 120 seconds from the cohort boundary.
-- Exit/mark: first supported same-source-instance/same-epoch state for the
-  same `(pool, mint)` at or after 120 seconds following the paper entry.
-- The exit is an observed-state mark only. H3 does **not** infer a
-  hypothetical fill or claim PnL. A separate, independently reviewed exact
-  executable-quote contract would be required before an economic paper test.
-
-## Target and Controls
-
-- Target: one deterministic first eligible base-fingerprint match per
-  `(pool, 20-second availability bucket)`, evaluated strictly before that
-  event updates state.
-- Controls: up to four deterministic, same-source-instance/same-epoch,
-  canonical-SOL-quote, different-mint non-match candidates. Selection is by
-  SHA-256 of frozen seed plus target/control identities; no outcome field is
-  read.
-- Dependence clusters: `(source_instance_id, continuity_epoch, pool,
-  20-second availability bucket)`. Any later estimate must report cluster-aware
-  uncertainty; raw rows must not be treated as independent trades.
-
-## Fresh Gate
-
-The one-shot actionability summary may be produced only after all are true:
-
-- three post-boundary sealed source partitions;
-- at least 1,000 target fingerprint matches with complete delayed entry and
-  120-second mark eligibility, or an independently approved smaller target;
-- zero source reconnects, continuity gaps, late-earlier violations, decoder
-  rejections, watermark regressions, and missing scheduled ticks since the
-  boundary;
-- exact source/decoder/registry/materializer/indexer hashes stored in the
-  pre-evaluation manifest.
-
-Any interruption invalidates the active candidate cohort rather than bridging
-it. Valid pre-wall evidence may be retained only under a separately approved
-segmented accounting amendment; no such amendment is proposed here.
-
-## Explicit Non-Claims
-
-H3 cannot establish profitability, executable fill quality, autonomous
-trading readiness, or a permission to send a live order. Those require a
-separate exact executable-quote/economic gate and then a separately approved
-dust-size calibration.
+Regardless of the pre-H3 qualification result, a separate bounded offline
+discovery protocol must select exactly one novel, predeclared H3 economic
+hypothesis before a fresh H3 boundary can be created.  No H3 name, threshold,
+or entry rule is frozen in this document.

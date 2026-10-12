@@ -1,0 +1,143 @@
+# Proposed Pre-H3 Actionability Qualification V1
+
+Status: `PROPOSED_FOR_INDEPENDENT_AUDIT_ONLY`  
+Boundary/cohort/result created: `NO`
+
+## Scope and Hypothesis
+
+This is explicitly **not H3** and is not an economic, profitability, fill, or
+live-trading test.
+
+**Primary hypothesis:** among all pre-entry-eligible events selected by the
+already frozen base kEfi fingerprint, the probability of a *complete
+mechanically actionable trajectory* is greater than for deterministic,
+contemporaneous, context-matched fingerprint non-matches.
+
+It addresses H1's failure by testing the missing operational premise directly:
+whether a selection match remains observable and mechanically usable after a
+conservative delay.  It does not claim that an actionable match is profitable.
+
+## Frozen Inputs
+
+- Base fingerprint artifact SHA-256:
+  `db08899d92f4d69d8c0234cfff9cbd05bd27dfb1365aed88d08b85f88cfc1b4`.
+- No refit, threshold adjustment, feature selection, overlay, or model-family
+  comparison.
+- Fresh evidence begins only after this proposal is independently approved and
+  a new boundary is written.
+- Historical, H1-opened, H2-quarantined, operational, and pre-boundary data
+  are rejected by the mandatory epoch registry.
+
+## Cohort and Denominator
+
+The primary denominator is fixed **before** delayed-entry or exit availability
+is known:
+
+1. After a 120-second boundary warm-up, admit every unique event that is
+   pre-entry eligible under the frozen base fingerprint and has the required
+   source order, exact PumpSwap instruction/event transition, canonical SOL
+   quote layout, non-SOL base mint, and reconstructable pre-event state.
+2. One target per `(source_instance_id, continuity_epoch, pool,
+   20-second availability bucket)` is retained by deterministic first source
+   order.  This de-duplicates exposure; it does **not** condition on later
+   tradeability.
+3. Every admitted target remains in the denominator.  A missing supported
+   state at delay, a non-tradeable later state, an incomplete horizon, or a
+   hard wall is a predefined outcome, never a row deletion or re-sampling
+   opportunity.
+
+An admitted target's primary binary outcome is `COMPLETE_ACTIONABLE_TRAJECTORY`:
+
+- `1` only when both are present within the same source instance and epoch:
+  - first supported exact state for the same `(pool,mint)` at or after the
+    fixed 1-second entry delay; and
+  - first supported exact state at or after 120 seconds following that entry.
+- `0` otherwise, classified as exactly one of:
+  `NO_POST_DELAY_ENTRY_STATE`, `POST_DELAY_NON_TRADEABLE_<reason>`,
+  `NO_120S_MARK`, `POST_ENTRY_NON_TRADEABLE_<reason>`, or
+  `HARD_WALL_INCOMPLETE_HORIZON`.
+
+No paper PnL, inferred fill, or later outcome is read to define this endpoint.
+
+## Frozen Contemporary Controls
+
+For each target, choose up to four fingerprint **non-matches** using only data
+available strictly before their own candidate event.  Candidates are eligible
+only if they match every frozen stratum below:
+
+- same `source_instance_id` and `continuity_epoch`;
+- same 20-second `received_at_unix_ns` availability bucket;
+- canonical SOL quote and non-SOL base layout;
+- exact PumpSwap transition validation and same `amount_mode`;
+- same fee-layout tuple: `lp_fee_bps`, `protocol_fee_bps`,
+  `coin_creator_bps`, `cashback_bps`, and `buyback_bps`;
+- same fixed pool-age bucket: `[0,30)`, `[30,120)`, `[120,300)`,
+  `[300,900)`, `[900,+inf)` seconds;
+- same fixed pre-event quote-liquidity log10 bucket of width `0.5`, computed
+  from reconstructed `pre_state.pool_quote_raw` only;
+- different mint from the target.
+
+Within that stratum, control identities are selected in ascending SHA-256 of
+`frozen-control-seed || target-event-key || control-event-key`.  No control
+may use post-entry state, a later mark, PnL, or a result field during selection.
+Targets with zero available controls remain in the target denominator and are
+reported in the primary cohort; they are omitted only from paired comparison,
+with the omission count and strata reported.
+
+Dependence clusters are
+`(source_instance_id, continuity_epoch, pool, 20-second availability bucket)`.
+
+## Primary Endpoint and Decision Rule
+
+Let `A_T` be the target complete-actionability proportion over **all admitted
+targets**.  Let `A_C` be the equal-target-weighted mean complete-actionability
+proportion of that target's selected controls.  The sole primary endpoint is
+`Delta_A = A_T - A_C`.
+
+The reported interval is a two-sided 95% cluster bootstrap interval for
+`Delta_A`, resampling the frozen dependence clusters and retaining each
+target/control set together.  The bootstrap seed, replicate count (`10,000`),
+and cluster identities are frozen in the boundary receipt.
+
+The qualification result is:
+
+- **PASS** only if all data-quality gates pass, at least 300 targets and 40
+  distinct target pools/mints occur across at least 8 chronological blocks,
+  no one pool supplies more than 10% of targets, at least 70% of targets have
+  one or more matched controls, and the lower bound of the 95% cluster
+  interval for `Delta_A` is strictly greater than zero.
+- **REJECT** if all data-quality gates and minimum representation floors pass
+  and the upper bound of that interval is less than or equal to zero.
+- **INCONCLUSIVE** for every other outcome: insufficient target/control
+  representation, interval spanning zero, or any predeclared quality gate
+  failing.  An inconclusive result does not authorize a rerun or tuning on the
+  same fresh cohort.
+
+Chronological-block estimates and the full outcome-reason distribution are
+descriptive integrity diagnostics, not additional endpoints and not tuning
+inputs.
+
+## Evidence and Continuity Gates
+
+Every row must have one and only one `FUTURE_UNOPENED`/`UNOPENED` epoch after
+the frozen boundary, plus source instance, continuity epoch, durable output
+sequence, event index, and source-frame SHA-256.  Exact source order is
+`(source_instance_id, continuity_epoch, durable_output_sequence, event_index,
+source_frame_sha256)`.
+
+Any reconnect, continuity gap, late-earlier ordering violation, decoder
+rejection, watermark regression, missing scheduled tick, or source hard wall
+invalidates the active candidate cohort.  No interval is bridged.  All such
+events are reported rather than silently omitted.
+
+## Explicit Non-Claims and Next Step
+
+PASS would qualify only the operational/actionability premise.  It does not
+rescue H1, establish PnL, validate a paper entry/exit fill, or authorize H3 or
+live execution.
+
+After this study, the remaining route to a genuine H3 is a bounded offline
+discovery protocol that selects **one** novel hypothesis intended to explain
+why H1's broad selection rule had poor economics, then an independently
+reviewed fresh H3 economic paper/control specification.  That later proposal
+must be new; it may not relabel this cohort as H3.
