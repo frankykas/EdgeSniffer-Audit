@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
@@ -18,6 +19,10 @@ from typing import Iterable
 
 SCHEMA = "KEFI_H3_PUMPSWAP_MECHANICS_V1"
 WSOL = "So11111111111111111111111111111111111111112"
+CONTROL_BUCKET_NS = 20_000_000_000
+POOL_AGE_BUCKET_SECONDS = (30, 120, 300, 900)
+LIQUIDITY_LOG10_BUCKET_WIDTH = 0.5
+FEE_FIELDS = ("lp_fee_bps", "protocol_fee_bps", "coin_creator_bps", "cashback_bps", "buyback_bps")
 
 
 class NonTradeable(ValueError):
@@ -145,24 +150,102 @@ def cluster_key(row: dict, bucket_ns: int) -> str:
     return f"source={instance}|epoch={epoch}|pool={row['pool']}|bucket={received // bucket_ns}"
 
 
+def observed_pool_first_seen(rows: Iterable[dict]) -> dict[tuple[str, int, str], int]:
+    """First source-observed timestamp per pool, never a chain-history claim."""
+    result: dict[tuple[str, int, str], int] = {}
+    for row in sorted_unique(rows):
+        received, instance, epoch, *_ = availability_key(row)
+        key = (instance, epoch, str(row.get("pool", "")))
+        if not key[-1]:
+            raise NonTradeable("MISSING_POOL_IDENTITY")
+        result.setdefault(key, received)
+    return result
+
+
+def bucket_pool_age(observed_seconds: float) -> str:
+    if observed_seconds < 0:
+        raise NonTradeable("NEGATIVE_OBSERVED_POOL_AGE")
+    lower = 0
+    for upper in POOL_AGE_BUCKET_SECONDS:
+        if observed_seconds < upper:
+            return f"[{lower},{upper})"
+        lower = upper
+    return f"[{lower},+inf)"
+
+
+def fee_tuple(row: dict) -> tuple[int, ...]:
+    try:
+        return tuple(int(row[field]) for field in FEE_FIELDS)
+    except (KeyError, TypeError, ValueError) as error:
+        raise NonTradeable("MISSING_PREENTRY_FEE_LAYOUT") from error
+
+
+def control_context(row: dict, first_seen: dict[tuple[str, int, str], int]) -> tuple:
+    """Frozen matching state derived only from the candidate's pre-event view.
+
+    The input row can contain later trajectory fields, but this function never
+    reads them.  ``amount_mode`` and fee fields are the exact immutable
+    PumpSwap layout attached to the candidate update; pool age and liquidity
+    are reconstructed before that update's state transition.
+    """
+    if not tradeable(row)["tradeable"]:
+        raise NonTradeable("UNSUPPORTED_PREENTRY_LAYOUT")
+    received, instance, epoch, *_ = availability_key(row)
+    pool = str(row.get("pool", ""))
+    seen = first_seen.get((instance, epoch, pool))
+    if seen is None:
+        raise NonTradeable("MISSING_OBSERVED_POOL_AGE")
+    state = pre_state(row)
+    quote = int(state["pool_quote_raw"])
+    if quote <= 0:
+        raise NonTradeable("NONPOSITIVE_PREENTRY_LIQUIDITY")
+    liquidity_bucket = math.floor(math.log10(quote) / LIQUIDITY_LOG10_BUCKET_WIDTH)
+    age_seconds = (received - seen) / 1_000_000_000
+    return (
+        instance,
+        epoch,
+        received // CONTROL_BUCKET_NS,
+        "CANONICAL_WSOL_NON_WSOL_BASE",
+        str(row["amount_mode"]),
+        fee_tuple(row),
+        bucket_pool_age(age_seconds),
+        liquidity_bucket,
+    )
+
+
 def deterministic_controls(targets: Iterable[dict], candidates: Iterable[dict], *, bucket_ns: int,
                            per_target: int, seed: str) -> dict[tuple, list[dict]]:
-    """Choose within-epoch, same-layout, different-mint controls reproducibly."""
+    """Choose frozen-stratum, pre-entry-only controls reproducibly.
+
+    ``bucket_ns`` is retained as an explicit compatibility/assertion argument;
+    the qualification contract fixes it at exactly 20 seconds.
+    """
     if per_target <= 0:
         raise ValueError("per_target must be positive")
-    indexed: dict[tuple[int, str], list[dict]] = defaultdict(list)
-    for row in sorted_unique(candidates):
-        check = tradeable(row)
-        if check["tradeable"]:
-            _, instance, epoch, *_ = availability_key(row)
-            indexed[(instance, epoch, str(row["quote_mint"]))].append(row)
-    chosen: dict[tuple, list[dict]] = {}
-    for target in sorted_unique(targets):
-        target_check = tradeable(target)
-        if not target_check["tradeable"]:
+    if bucket_ns != CONTROL_BUCKET_NS:
+        raise ValueError("qualification control bucket must be exactly 20 seconds")
+    target_rows, candidate_rows = list(targets), list(candidates)
+    unique_rows: dict[tuple[str, int, int, int, str], dict] = {}
+    for row in [*target_rows, *candidate_rows]:
+        key = event_key(row)
+        existing = unique_rows.setdefault(key, row)
+        if existing != row:
+            raise NonTradeable("CONFLICTING_DUPLICATE_CANDIDATE")
+    ordered_candidates = sorted_unique(candidate_rows)
+    first_seen = observed_pool_first_seen(unique_rows.values())
+    indexed: dict[tuple, list[dict]] = defaultdict(list)
+    for row in ordered_candidates:
+        try:
+            indexed[control_context(row, first_seen)].append(row)
+        except NonTradeable:
             continue
-        _, instance, epoch, *_ = availability_key(target)
-        options = [row for row in indexed[(instance, epoch, str(target["quote_mint"]))]
+    chosen: dict[tuple, list[dict]] = {}
+    for target in sorted_unique(target_rows):
+        try:
+            target_context = control_context(target, first_seen)
+        except NonTradeable:
+            continue
+        options = [row for row in indexed[target_context]
                    if str(row.get("mint")) != str(target.get("mint"))]
         identity = "|".join(map(str, event_key(target)))
         options.sort(key=lambda row: hashlib.sha256(

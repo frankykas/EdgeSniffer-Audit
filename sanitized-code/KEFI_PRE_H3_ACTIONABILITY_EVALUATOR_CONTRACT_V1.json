@@ -1,0 +1,55 @@
+{
+  "schema": "KEFI_PRE_H3_ACTIONABILITY_EVALUATOR_CONTRACT_V1",
+  "status": "FROZEN_CANDIDATE_PENDING_INDEPENDENT_APPROVAL",
+  "boundary_created": false,
+  "cohort_created": false,
+  "pnl_accessed": false,
+  "primary_populations": {
+    "A_T_all": "all admitted pre-entry eligible targets, including zero-control targets",
+    "Delta_A_paired": "only targets with at least one frozen matched control; controls equal-target weighted"
+  },
+  "control_strata": {
+    "same_source_instance_epoch": true,
+    "availability_bucket_ns": 20000000000,
+    "canonical_wsol_non_wsol_base": true,
+    "same_amount_mode": true,
+    "same_fee_tuple": [
+      "lp_fee_bps",
+      "protocol_fee_bps",
+      "coin_creator_bps",
+      "cashback_bps",
+      "buyback_bps"
+    ],
+    "pool_age_buckets_seconds": [30, 120, 300, 900],
+    "liquidity_log10_bucket_width": 0.5,
+    "different_mint": true,
+    "post_entry_fields_used": false,
+    "selection": "ascending SHA-256(frozen-control-seed || target-event-key || control-event-key)"
+  },
+  "bootstrap": {
+    "replicates": 10000,
+    "confidence_interval": "two-sided 95% cluster bootstrap",
+    "cluster": ["source_instance_id", "continuity_epoch", "pool", "20-second availability bucket"],
+    "resampling": "retain every target with its entire frozen control set"
+  },
+  "representation_gates": {
+    "minimum_targets": 300,
+    "minimum_distinct_pools": 40,
+    "minimum_chronological_blocks": 8,
+    "maximum_pool_share": 0.1,
+    "minimum_control_coverage": 0.7
+  },
+  "decision_thresholds": {
+    "minimum_A_T_all_ci95_lower": 0.7,
+    "minimum_Delta_A_paired_ci95_lower": 0.1,
+    "reject_if_A_T_all_ci95_upper_below": 0.7,
+    "reject_if_Delta_A_paired_ci95_upper_at_or_below": 0.0
+  },
+  "outcomes": ["PASS", "REJECT", "INCONCLUSIVE"],
+  "implementation": {
+    "mechanics_script": "scripts/kefi_h3_pumpswap_mechanics_v1.py",
+    "mechanics_sha256": "cec0bc53ea0a83a947320e6df789b4bb3b3aac5dc7b95600004f18f8eecffa6d",
+    "evaluator_script": "scripts/kefi_pre_h3_actionability_evaluator_v1.py",
+    "evaluator_sha256": "b4c47e3b5d4de8cd6c583077cee5d40c2c2e77732fe21c0c20d1433765e30aa8"
+  }
+}

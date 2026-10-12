@@ -72,10 +72,18 @@ only if they match every frozen stratum below:
 - same fee-layout tuple: `lp_fee_bps`, `protocol_fee_bps`,
   `coin_creator_bps`, `cashback_bps`, and `buyback_bps`;
 - same fixed pool-age bucket: `[0,30)`, `[30,120)`, `[120,300)`,
-  `[300,900)`, `[900,+inf)` seconds;
+  `[300,900)`, `[900,+inf)` seconds, where age is the observed elapsed time
+  since the first source-sequenced event for that pool in the same source
+  instance/epoch.  It is deliberately an *observed age*, not an invented
+  chain-history age;
 - same fixed pre-event quote-liquidity log10 bucket of width `0.5`, computed
   from reconstructed `pre_state.pool_quote_raw` only;
 - different mint from the target.
+
+The control matcher reads no post-entry trajectory, later mark, PnL, return,
+or result field.  Its complete frozen input is the source order, availability
+time, pre-event reconstructed state, immutable PumpSwap layout/fee fields, and
+mint/pool identifiers listed above.
 
 Within that stratum, control identities are selected in ascending SHA-256 of
 `frozen-control-seed || target-event-key || control-event-key`.  No control
@@ -89,25 +97,44 @@ Dependence clusters are
 
 ## Primary Endpoint and Decision Rule
 
-Let `A_T` be the target complete-actionability proportion over **all admitted
-targets**.  Let `A_C` be the equal-target-weighted mean complete-actionability
-proportion of that target's selected controls.  The sole primary endpoint is
-`Delta_A = A_T - A_C`.
+Let `A_T_all` be the target complete-actionability proportion over **all
+admitted targets**, including targets with zero matched controls.  It is always
+reported as the absolute operational rate.
 
-The reported interval is a two-sided 95% cluster bootstrap interval for
-`Delta_A`, resampling the frozen dependence clusters and retaining each
-target/control set together.  The bootstrap seed, replicate count (`10,000`),
-and cluster identities are frozen in the boundary receipt.
+For the comparative estimand, retain only the fixed subset `P` of targets with
+at least one frozen matched control.  Let `A_C_paired` be the equal-target-
+weighted mean actionability of controls within each target's control set.
+The sole comparative primary endpoint is
+`Delta_A_paired = A_T_paired - A_C_paired`, calculated only over `P`.
+
+Cluster bootstrap resampling retains each target with its entire frozen control
+set.  It never lets unmatched targets dilute the paired comparison and never
+lets the paired restriction erase them from `A_T_all`.
+
+The reported intervals are two-sided 95% cluster-bootstrap intervals for both
+`A_T_all` and `Delta_A_paired`, resampling the frozen dependence clusters and
+retaining each target/control set together.  The bootstrap seed, replicate
+count (`10,000`), and cluster identities are frozen in the boundary receipt.
+
+The following operationally meaningful thresholds are frozen before fresh
+outcomes: a lower 95% bound of at least `70%` for `A_T_all`, and a lower 95%
+bound of at least `+10 percentage points` for `Delta_A_paired`.  These are
+qualification floors, not fitted thresholds: a tool that cannot preserve a
+complete delayed/120-second trajectory for at least 70% of all signals, or
+cannot beat matched contemporaneous controls by a material margin, is not a
+useful foundation for a later economic hypothesis.
 
 The qualification result is:
 
 - **PASS** only if all data-quality gates pass, at least 300 targets and 40
   distinct target pools/mints occur across at least 8 chronological blocks,
   no one pool supplies more than 10% of targets, at least 70% of targets have
-  one or more matched controls, and the lower bound of the 95% cluster
-  interval for `Delta_A` is strictly greater than zero.
+  one or more matched controls, the lower bound of the 95% cluster interval
+  for `A_T_all` is at least 70%, and the lower bound for
+  `Delta_A_paired` is at least +10 percentage points.
 - **REJECT** if all data-quality gates and minimum representation floors pass
-  and the upper bound of that interval is less than or equal to zero.
+  and either the upper bound for `A_T_all` is below 70% or the upper bound for
+  `Delta_A_paired` is less than or equal to zero.
 - **INCONCLUSIVE** for every other outcome: insufficient target/control
   representation, interval spanning zero, or any predeclared quality gate
   failing.  An inconclusive result does not authorize a rerun or tuning on the
@@ -116,6 +143,21 @@ The qualification result is:
 Chronological-block estimates and the full outcome-reason distribution are
 descriptive integrity diagnostics, not additional endpoints and not tuning
 inputs.
+
+## Frozen Evaluator
+
+`scripts/kefi_pre_h3_actionability_evaluator_v1.py` is the only supported
+decision evaluator.  It accepts a pre-built assignment file; it cannot create
+a cohort, choose controls, or inspect PnL.  Each assignment contains one
+target, its frozen cluster/pool/block identity, the all-target binary outcome,
+and its zero-to-four already selected control outcomes.  It emits exactly
+`PASS`, `REJECT`, or `INCONCLUSIVE` using the rules above.  The public
+regression suite proves all-target versus paired-population accounting,
+positive PASS, conclusive REJECT, and INCONCLUSIVE coverage behavior.
+The machine-readable frozen candidate contract is
+`KEFI_PRE_H3_ACTIONABILITY_EVALUATOR_CONTRACT_V1.json`; its source hashes bind
+the reviewed matcher and evaluator implementation.  Neither artifact creates a
+boundary or a cohort.
 
 ## Evidence and Continuity Gates
 

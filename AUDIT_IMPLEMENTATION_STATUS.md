@@ -1,6 +1,6 @@
 # kEfi Audit Remediation Status
 
-Last reconciled: 2026-10-12 03:43 EDT (2026-10-12T07:43Z) against the live VPS.
+Last reconciled: 2026-10-12 11:30 EDT (2026-10-12T15:30Z) against the live VPS and public regression suite.
 
 This is a status ledger, not a claim that the research is ready for live trading.
 `VERIFIED` means checked against the live host or an executable test. `IMPLEMENTED`
@@ -42,6 +42,17 @@ It needs independent review before a **pre-H3 qualification** boundary is
 written.  A real H3 remains blocked pending separate offline discovery of one
 new post-H1 economic hypothesis and its own independent review.
 
+The qualification now has an executable frozen control matcher and evaluator.
+Controls require identical source instance/epoch, 20-second availability
+bucket, canonical layout, amount mode, complete fee tuple, observed pre-entry
+pool-age bucket, and reconstructed pre-entry liquidity bucket, with a different
+mint.  The matcher never reads post-entry trajectory fields.  The evaluator
+reports `A_T_all` over every admitted target and `Delta_A_paired` only over
+targets with one or more frozen controls; it has predeclared PASS / REJECT /
+INCONCLUSIVE rules with 10,000 cluster-bootstrap replicates, a 70% absolute
+all-target actionability lower-CI floor, and a 10-point paired-effect lower-CI
+floor.  This is implementation/test verification only, not fresh evaluation.
+
 ## Current Safety State
 
 | Surface | Status | Evidence / consequence |
@@ -59,7 +70,8 @@ new post-H1 economic hypothesis and its own independent review.
 
 ### 1. Quarantine scientific epochs
 
-**Status: STRICT REGISTRY POLICY TESTED; PIPELINE INTEGRATION OPEN.**
+**Status: VERIFIED FOR THE SCIENTIFIC PIPELINE; OPERATIONAL GENERIC PATH
+REMAINS NON-SCIENTIFIC BY DESIGN.**
 
 The following must become durable registry records before H3 discovery/fresh
 collection:
@@ -81,9 +93,12 @@ Eligibility requires membership in exactly one post-boundary
 pre-boundary, gap, overlapping-epoch ambiguity, and invalid kind/status cases
 are rejected. A post-boundary future-unopened record is accepted.
 The separately tested cohort-admission guard calls this policy using real UTC
-parsing, including exact fractional-second boundaries. It is not yet wired into
-materialization or boundary creation, and no epoch record has been used to
-create a cohort.
+parsing, including exact fractional-second boundaries. The only supported
+scientific materializer runner requires the registry, boundary, strict row
+validation, and deterministic source order. The paper contract requires the
+resulting scientific receipt and its row hash. Generic operational
+materialization cannot pass that scientific contract. No epoch record has been
+used to create a qualification or H3 cohort.
 
 ### 2. Actual materializer regression suite
 
@@ -132,7 +147,8 @@ be the final catalog for the incremental evidence layer.
 
 ### 5. Retire repeated full-history JSONL dedup
 
-**Status: QUEUE-DRIVEN IMPLEMENTATION TESTED; LIVE INTEGRATION OPEN.**
+**Status: QUEUE-DRIVEN IMPLEMENTATION AND ISOLATED LIVE PROOF VERIFIED;
+CONTINUOUS SCIENTIFIC TIMER NOT ENABLED PENDING SPEC APPROVAL.**
 
 The service runner no longer calls the global deduplicated-market rebuild after
 each bounded cycle. A live four-window bounded cycle completed without that
@@ -147,44 +163,48 @@ yet enabled on the live materializer timer. A separate low-priority systemd
 runner was installed but remains disabled; its isolated VPS queue/recovery
 smoke passed without touching capture. A two-run isolated VPS proof over
 copied sealed windows produced identical canonical exports after an interrupted
-descriptor claim: 25,406 events and 35,317 exposures. Compact research-table
-publication and a production operational proof remain required; periodic full
-integrity scrubs must remain outside the hot append path.
+descriptor claim: 25,406 events and 35,317 exposures. A fresh post-repair live
+scientific proof additionally indexed 28,725 ordered rows with source-instance,
+epoch, and durable-sequence provenance. Continuous scientific timer activation
+is intentionally deferred until specification approval; periodic full
+integrity scrubs remain outside the hot append path.
 
 ### 6. Restart-safe content verification
 
-**Status: PARTIALLY IMPLEMENTED; INTEGRATION OPEN.**
+**Status: VERIFIED FOR THE PRE-H3 QUALIFICATION PATH.**
 
-The materializer now verifies a remembered output against its current receipt
-and rows hash. It still needs integration with the canonical index, which will
-persist the original receipt hash, source-manifest references, decoder identity
-and schema. Bare IDs are not sufficient scientific provenance.
+The materializer verifies remembered output against its current receipt and
+rows hash. The canonical index persists receipt hash, source-manifest
+references, decoder identity, intrinsic event identity, and window exposure.
+The fresh live proof verified restart-safe canonical export under this binding.
+Bare IDs remain insufficient provenance and are rejected.
 
 ### 7. Source-manifest / decoder binding
 
-**Status: PARTIALLY IMPLEMENTED; DATASET VERSION ENFORCEMENT OPEN.**
+**Status: VERIFIED FOR PRE-H3 QUALIFICATION; DATASET-GENERATION POLICY OPEN
+FOR FUTURE H3 DISCOVERY.**
 
-New materializer receipts bind partition-manifest/object hashes and decoder
-binary hash. The canonical dataset still needs an enforced decoder schema
-generation policy, intrinsic-event versus window-exposure separation, and an
-authenticated pre-decode input descriptor.
+Materializer receipts bind partition-manifest/object hashes and decoder binary
+hash. The canonical index separates intrinsic event identity from window
+exposure, and the scientific contract binds the exact receipt/row hash. A
+future H3 discovery dataset still needs a separately reviewed decoder-schema
+generation policy and authenticated compact-table publication.
 
 ### 8. Temporal/actionability and paper-mechanics audit
 
-**Status: PARTIALLY AUDITED; FROZEN SIMULATION CONTRACT BLOCKS H3.**
+**Status: PRE-H3 MECHANICS VERIFIED; TRUE H3 ECONOMIC CONTRACT NOT YET
+SPECIFIED.**
 
 A bounded 182,339-row / 70,365-source-event audit found no malformed identity,
 fee, or conflicting-event defects and established that `event_timestamp` is
-later than source receipt in every sampled row. Any future simulator must use
-`received_at_unix_ns` as its actionability clock, not chain event time. The
-new contract requires deterministic `durable_output_sequence` ordering for
-equal receipt times and exact raw PumpSwap instruction/event transitions; it
-forbids summed fee-BPS approximation. Current decoded rows lack that sequence,
-so the contract correctly reports `MISSING_DETERMINISTIC_SOURCE_ORDER`.
-Before H3 discovery, add that provenance then audit fixed entry delay,
-non-tradeable outcomes, exits, and clustering.
-No claim about a predictive/economic fingerprint may be made before this is
-complete.
+later than source receipt in every sampled row. Actionability uses
+`received_at_unix_ns`, not chain event time. The repaired live source now emits
+source instance, continuity epoch, and durable writer sequence; equal
+receipt-time ordering is deterministic. A fresh 28,725-row live proof
+validated exact raw instruction/event transitions, pre-state reconstruction,
+non-tradeable exclusions, same-epoch delay/mark mechanics, frozen strata, and
+cluster-aware evaluator logic. It forbids summed fee-BPS approximation.
+No economic claim may be made from this qualification.
 
 ### 9. Bounded H3 discovery tournament
 
