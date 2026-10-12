@@ -36,6 +36,7 @@ def main() -> int:
     parser.add_argument("--host-mount", type=pathlib.Path, required=True)
     parser.add_argument("--state", type=pathlib.Path, required=True)
     parser.add_argument("--collector-unit", required=True)
+    parser.add_argument("--materializer-unit")
     parser.add_argument("--systemd-scope", choices=("user", "system"), default="user")
     parser.add_argument("--warning-free-gib", type=float, default=180.0)
     parser.add_argument("--emergency-free-gib", type=float, default=150.0)
@@ -47,23 +48,38 @@ def main() -> int:
     warning = [item for item in volumes if item["freeGiB"] < args.warning_free_gib]
     status = "HEALTHY" if not warning else "WARNING"
     paused = False
-    if emergency:
-        status = "EMERGENCY_PAUSED"
+    actions: list[dict] = []
+
+    def systemctl(action: str, unit: str) -> bool:
         command = ["systemctl"]
         if args.systemd_scope == "user":
             command.append("--user")
-        subprocess.run([*command, "stop", args.collector_unit], check=False)
+        completed = subprocess.run([*command, action, unit], check=False, capture_output=True, text=True)
+        active = subprocess.run([*command, "is-active", "--quiet", unit], check=False).returncode == 0
+        actions.append({"action": action, "unit": unit, "returncode": completed.returncode, "activeAfter": active})
+        return not active
+
+    # Derived work is disposable/rebuildable. It is stopped before source
+    # capture whenever either monitored volume enters warning pressure.
+    if warning and args.materializer_unit:
+        systemctl("stop", args.materializer_unit)
+    if emergency:
+        stopped = systemctl("stop", args.collector_unit)
+        status = "EMERGENCY_PAUSED_VERIFIED" if stopped else "EMERGENCY_STOP_FAILED"
         pause = {
             "schema": "KEFI_LOCAL_FULL_META_CAPACITY_PAUSE_V1", "recordedAtUtc": now(),
             "reason": "LOCAL_STORAGE_BELOW_EMERGENCY_WATERMARK", "affectedVolumes": emergency,
             "collectorUnit": args.collector_unit,
+            "collectorStoppedVerified": stopped,
+            "systemdActions": actions,
             "manualResumeRequired": True,
         }
         atomic(args.state.parent / "capacity-pause.json", pause)
-        paused = True
+        paused = stopped
     atomic(args.state, {
         "schema": "KEFI_LOCAL_FULL_META_CAPACITY_GUARD_V1", "generatedAtUtc": now(),
         "volumes": volumes, "status": status, "paused": paused,
+        "systemdActions": actions,
         "warningFreeGiB": args.warning_free_gib, "emergencyFreeGiB": args.emergency_free_gib,
     })
     return 0
