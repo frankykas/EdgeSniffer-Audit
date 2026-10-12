@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 
@@ -42,3 +43,32 @@ def test_loaded_dead_unit_requires_successful_stop(monkeypatch):
 
     monkeypatch.setattr(guard.subprocess, "run", run)
     assert guard.verified_stop(["systemctl"], "collector.service")["verifiedStopped"] is True
+
+
+def test_statvfs_failure_still_reaches_collector_stop(monkeypatch, tmp_path):
+    guard = module()
+    calls, writes = [], []
+    monkeypatch.setattr(guard, "safe_volume", lambda path: (
+        (None, {"path": str(path), "reason": "STATVFS_FAILED"})
+        if "hot" in str(path) else ({"path": str(path), "freeGiB": 500}, None)
+    ))
+    monkeypatch.setattr(guard, "mounted_source", lambda _: {"findmntReturncode": 0, "source": "/dev/vdc1"})
+    monkeypatch.setattr(guard, "verified_stop", lambda _, unit: calls.append(unit) or {"unit": unit, "verifiedStopped": True})
+    monkeypatch.setattr(guard, "atomic", lambda _, value: writes.append(value))
+    monkeypatch.setattr(sys, "argv", ["guard", "--hot-root", str(tmp_path / "hot"), "--host-mount", str(tmp_path), "--state", str(tmp_path / "state"), "--collector-unit", "collector", "--materializer-timer-unit", "timer", "--materializer-service-unit", "service", "--hot-mount", str(tmp_path), "--expected-hot-source", "/dev/vdc1", "--systemd-scope", "system"])
+    assert guard.main() == 0
+    assert calls == ["timer", "service", "collector"]
+    assert writes[-1]["status"] == "EMERGENCY_PAUSED_VERIFIED"
+
+
+def test_warning_reports_failed_materializer_stop(monkeypatch, tmp_path):
+    guard = module()
+    calls, writes = [], []
+    monkeypatch.setattr(guard, "safe_volume", lambda path: ({"path": str(path), "freeGiB": 80}, None))
+    monkeypatch.setattr(guard, "mounted_source", lambda _: {"findmntReturncode": 0, "source": "/dev/vdc1"})
+    monkeypatch.setattr(guard, "verified_stop", lambda _, unit: calls.append(unit) or {"unit": unit, "verifiedStopped": unit != "service"})
+    monkeypatch.setattr(guard, "atomic", lambda _, value: writes.append(value))
+    monkeypatch.setattr(sys, "argv", ["guard", "--hot-root", str(tmp_path / "hot"), "--host-mount", str(tmp_path), "--state", str(tmp_path / "state"), "--collector-unit", "collector", "--materializer-timer-unit", "timer", "--materializer-service-unit", "service", "--hot-mount", str(tmp_path), "--expected-hot-source", "/dev/vdc1", "--systemd-scope", "system", "--warning-free-gib", "100", "--emergency-free-gib", "70"])
+    assert guard.main() == 0
+    assert calls == ["timer", "service"]
+    assert writes[-1]["status"] == "WARNING_MATERIALIZER_STOP_FAILED"

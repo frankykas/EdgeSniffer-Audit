@@ -52,8 +52,11 @@ Resolved:
 Still open:
 
 - a production-oriented test for a corrupt/replaced previously processed
-  window; and
-- a test that a failed `systemctl stop` cannot be reported as a verified pause.
+  window.
+
+Capacity-guard regressions now cover successful stop, failed stop, unknown
+unit, still-active/nonzero-PID state, failed `systemctl show`, missing hot-path
+measurement, and failed materializer service stop at warning pressure.
 
 ### 3. Capacity safety and mount identity
 
