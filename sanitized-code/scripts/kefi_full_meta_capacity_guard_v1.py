@@ -30,6 +30,13 @@ def volume(path: pathlib.Path) -> dict:
     return {"path": str(path), "freeGiB": round(stat.f_bavail * stat.f_frsize / 1024 ** 3, 3)}
 
 
+def safe_volume(path: pathlib.Path) -> tuple[dict | None, dict | None]:
+    try:
+        return volume(path), None
+    except OSError as error:
+        return None, {"path": str(path), "reason": "STATVFS_FAILED", "error": str(error)}
+
+
 def unit_state(command: list[str], unit: str) -> dict[str, str]:
     result = subprocess.run(
         [*command, "show", "--property=LoadState", "--property=ActiveState",
@@ -75,6 +82,8 @@ def main() -> int:
     parser.add_argument("--state", type=pathlib.Path, required=True)
     parser.add_argument("--collector-unit", required=True)
     parser.add_argument("--materializer-unit")
+    parser.add_argument("--materializer-timer-unit")
+    parser.add_argument("--materializer-service-unit")
     parser.add_argument("--hot-mount", type=pathlib.Path)
     parser.add_argument("--expected-hot-source")
     parser.add_argument("--systemd-scope", choices=("user", "system"), default="user")
@@ -96,21 +105,37 @@ def main() -> int:
         mount_identity = mounted_source(args.hot_mount)
         mount_failed = (mount_identity["findmntReturncode"] != 0
                         or mount_identity["source"] != args.expected_hot_source)
-    volumes = [volume(args.hot_root), volume(args.host_mount)]
+    hot_volume, hot_error = safe_volume(args.hot_root)
+    host_volume, host_error = safe_volume(args.host_mount)
+    volumes = [item for item in (hot_volume, host_volume) if item]
     emergency = [item for item in volumes if item["freeGiB"] < args.emergency_free_gib]
     warning = [item for item in volumes if item["freeGiB"] < args.warning_free_gib]
+    for error in (hot_error, host_error):
+        if error:
+            emergency.append(error); warning.append(error)
     if mount_failed:
         fault = {"path": str(args.hot_mount), "reason": "HOT_MOUNT_IDENTITY_FAILED"}
         emergency.append(fault); warning.append(fault)
     status = "HEALTHY" if not warning else "WARNING"
     paused = False
-    if warning and args.materializer_unit:
-        actions.append(verified_stop(command, args.materializer_unit))
+    materializer_units = [unit for unit in (
+        args.materializer_timer_unit, args.materializer_service_unit, args.materializer_unit
+    ) if unit]
+    materializer_stop_failed = False
+    if warning:
+        for unit in dict.fromkeys(materializer_units):
+            action = verified_stop(command, unit)
+            actions.append(action)
+            materializer_stop_failed = materializer_stop_failed or not action["verifiedStopped"]
+        if materializer_stop_failed and not emergency:
+            status = "WARNING_MATERIALIZER_STOP_FAILED"
     if emergency:
         collector_action = verified_stop(command, args.collector_unit)
         actions.append(collector_action)
         stopped = collector_action["verifiedStopped"]
         status = "EMERGENCY_PAUSED_VERIFIED" if stopped else "EMERGENCY_STOP_FAILED"
+        if materializer_stop_failed:
+            status += "_MATERIALIZER_STOP_FAILED"
         if mount_failed:
             status = "MOUNT_IDENTITY_FAILED_" + status
         atomic(args.state.parent / "capacity-pause.json", {

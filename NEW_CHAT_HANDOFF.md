@@ -115,9 +115,11 @@ At present we are before step 1 for the final kEfi H3 attempt.
   materializer units.
 - Patched capacity guard so it stops materialization first and only claims an
   emergency collector pause after successful `systemctl stop`, a loaded unit,
-  inactive/dead state, and `MainPID=0`. It verifies the hot mount resolves to
-  `/dev/vdc1` on every guard cycle. The current deployed guard SHA-256 is
-  `9d4c9c0f4297a4099bf724cb41d00515a5c78a6ecaa80f235383d3f37a908e3d`.
+  inactive/dead state, and `MainPID=0`. Missing hot-path measurement is an
+  emergency condition; warning pressure targets both materializer timer and
+  service. It verifies the hot mount resolves to `/dev/vdc1` on every guard
+  cycle. The current deployed guard SHA-256 is
+  `63f14bef120fd04291d47641e9081b0a67c771968bf78b64fc96b078197ede13`.
 - Removed the service runner's automatic global `market-deduplicated.jsonl`
   rebuild after every bounded materializer cycle. A bounded live four-window
   cycle passed without triggering the rebuild.

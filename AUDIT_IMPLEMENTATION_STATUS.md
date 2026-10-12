@@ -1,6 +1,6 @@
 # kEfi Audit Remediation Status
 
-Last reconciled: 2026-10-12 00:31 EDT (2026-10-12T04:31Z) against the live VPS.
+Last reconciled: 2026-10-12 00:44 EDT (2026-10-12T04:44Z) against the live VPS.
 
 This is a status ledger, not a claim that the research is ready for live trading.
 `VERIFIED` means checked against the live host or an executable test. `IMPLEMENTED`
@@ -16,7 +16,7 @@ claim has been made and no H3 paper boundary may rely on it.
 | Hot-volume routing | VERIFIED | `/mnt/edgesniffer-kefi-hot` is `/dev/vdc1`; source and materializer units have explicit routing overrides. |
 | Mount identity fail-closed check | IMPLEMENTED | Service pre-start checks require the mountpoint and `/dev/vdc1`. A reboot/mount-loss simulation has not been run because it would interrupt capture. |
 | Materializer timer | INTENTIONALLY INACTIVE | It remains disabled while the full-history JSONL design is replaced. Capture continues; this prevents another escalating I/O scan from competing with ingest. |
-| Capacity guard | VERIFIED HEALTHY; HARDENED | Guard checks root plus hot path plus the live `/dev/vdc1` mount identity. It stops materialization first and requires a successful stop plus loaded/inactive/dead/zero-PID state before claiming an emergency pause. Mocked negative-path tests now cover missing-unit failure. |
+| Capacity guard | VERIFIED HEALTHY; HARDENED | Guard checks root plus hot path plus the live `/dev/vdc1` mount identity. Missing-path measurement is itself an emergency input. At warning it verifies both materializer timer and service; failure is explicit. Emergency pause requires successful stop plus loaded/inactive/dead/zero-PID state. |
 | Root free capacity | WATCH | 112 GiB free at reconciliation. New source/promotion writes are routed off root; legacy root data still needs verified archive/release. |
 | Hot free capacity | VERIFIED ADEQUATE | 406 GiB free at reconciliation. |
 
