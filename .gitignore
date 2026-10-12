@@ -1,0 +1,18 @@
+# Never publish runtime credentials, raw market evidence, or generated bulk data.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.token
+raw/
+evidence/
+exports/
+*.zst
+*.sqlite
+*.db
+*.jsonl
+__pycache__/
+*.pyc
+*.log
