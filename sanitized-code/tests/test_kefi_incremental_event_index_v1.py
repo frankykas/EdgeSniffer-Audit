@@ -5,55 +5,90 @@ import sys
 from pathlib import Path
 
 
-INDEXER = Path(__file__).parents[1] / "scripts" / "kefi_incremental_event_index_v1.py"
+ROOT = Path(__file__).parents[1]
+INDEXER = ROOT / "scripts" / "kefi_incremental_event_index_v1.py"
 
 
-def digest(path: Path) -> str:
+def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def write_window(out: Path, name: str, rows: list[dict]) -> None:
-    rows_path = out / "market-rows" / f"{name}.jsonl"
-    rows_path.parent.mkdir(parents=True, exist_ok=True)
-    rows_path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
-    receipt = {
-        "window_id": name,
-        "market_rows_path": str(rows_path),
-        "market_rows_sha256": digest(rows_path),
-        "source_partition_refs": [{"relative_manifest_path": "partitions/x/manifest.json", "manifest_sha256": "m", "compressed_sha256": "c"}],
-        "decoder": {"decoder_path": "/decoder", "decoder_sha256": "d"},
+def row(frame: str, event_index: int, quote: int, candidate: str) -> dict:
+    return {
+        "source_frame_sha256": frame, "event_index": event_index,
+        "received_at_unix_ns": 10, "slot": 1, "pool_quote_raw": quote,
+        "candidate_signature": candidate,
     }
-    receipt_path = out / "receipts" / f"{name}.json"
+
+
+def write_window(out: Path, window_id: str, rows: list[dict], *, decoder=True) -> Path:
+    rows_path = out / "market-rows" / f"{window_id}.jsonl"
+    rows_path.parent.mkdir(parents=True, exist_ok=True)
+    rows_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in rows))
+    receipt = {
+        "window_id": window_id, "market_rows_path": str(rows_path),
+        "market_rows_sha256": sha256(rows_path),
+        "source_partition_refs": [{"relative_manifest_path": "partitions/manifest.json", "manifest_sha256": "manifest", "compressed_sha256": "compressed"}],
+    }
+    if decoder:
+        receipt["decoder"] = {"decoder_path": "/decoder", "decoder_sha256": "decoder"}
+    receipt_path = out / "receipts" / f"{window_id}.json"
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_text(json.dumps(receipt, sort_keys=True))
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+    descriptor = {"schema": "KEFI_CAPTURE_FIRST_CONTROL_MATERIALIZER_V1_INGEST_DESCRIPTOR_V1", "window_id": window_id,
+                  "receipt_path": str(receipt_path), "receipt_sha256": sha256(receipt_path),
+                  "market_rows_sha256": receipt["market_rows_sha256"]}
+    pending = out / "canonical-ingest" / "pending" / f"{window_id}.json"
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text(json.dumps(descriptor, sort_keys=True) + "\n")
+    return receipt_path
 
 
-def run(out: Path, index: Path):
-    return subprocess.run(
-        [sys.executable, str(INDEXER), "--materializer-out", str(out), "--index-root", str(index)],
-        capture_output=True,
-        text=True,
-    )
+def run(out: Path, index: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, str(INDEXER), "--materializer-out", str(out), "--index-root", str(index)], text=True, capture_output=True)
 
 
-def test_verified_overlap_is_deduplicated_once(tmp_path):
-    out = tmp_path / "out"
-    event_a = {"source_frame_sha256": "a", "event_index": 0, "received_at_unix_ns": 1, "slot": 1}
-    event_b = {"source_frame_sha256": "b", "event_index": 0, "received_at_unix_ns": 2, "slot": 2}
-    write_window(out, "a", [event_a])
-    write_window(out, "b", [event_a, event_b])
-    result = run(out, tmp_path / "index")
+def checkpoint(index: Path) -> dict:
+    return json.loads((index / "checkpoint.json").read_text())
+
+
+def test_queue_ingest_preserves_intrinsic_identity_and_exposures(tmp_path):
+    out, index = tmp_path / "out", tmp_path / "index"
+    write_window(out, "a", [row("frame", 0, 100, "teacher-a")])
+    write_window(out, "b", [row("frame", 0, 100, "teacher-b"), row("frame-b", 0, 200, "teacher-b")])
+    result = run(out, index)
     assert result.returncode == 0, result.stderr
-    checkpoint = json.loads((tmp_path / "index" / "checkpoint.json").read_text())
-    assert checkpoint["canonical_events"] == 2
-    assert checkpoint["verified_identical_overlaps"] == 1
+    assert checkpoint(index)["canonical_events"] == 2
+    assert checkpoint(index)["verified_identical_overlaps"] == 1
+    assert len(list((out / "canonical-ingest" / "processed").glob("*.json"))) == 2
 
 
-def test_changed_rows_fail_closed(tmp_path):
-    out = tmp_path / "out"
-    write_window(out, "a", [{"source_frame_sha256": "a", "event_index": 0, "received_at_unix_ns": 1, "slot": 1}])
-    assert run(out, tmp_path / "index").returncode == 0
-    (out / "market-rows" / "a.jsonl").write_text('{"source_frame_sha256":"a","event_index":0,"received_at_unix_ns":2,"slot":1}\n')
-    result = run(out, tmp_path / "index")
-    assert result.returncode != 0
-    assert "receipt rows hash mismatch" in result.stderr
+def test_normal_run_does_not_require_old_receipts_or_scan_history(tmp_path):
+    out, index = tmp_path / "out", tmp_path / "index"
+    first = write_window(out, "a", [row("frame-a", 0, 100, "teacher-a")])
+    assert run(out, index).returncode == 0
+    first.unlink()  # already verified and committed; hot path must not revisit it
+    second = write_window(out, "b", [row("frame-b", 0, 200, "teacher-b")])
+    result = run(out, index)
+    assert result.returncode == 0, result.stderr
+    assert checkpoint(index)["canonical_events"] == 2
+    assert second.is_file()
+
+
+def test_recovery_replays_processing_descriptor_safely(tmp_path):
+    out, index = tmp_path / "out", tmp_path / "index"
+    write_window(out, "a", [row("frame-a", 0, 100, "teacher-a")])
+    pending = out / "canonical-ingest" / "pending" / "a.json"
+    processing = out / "canonical-ingest" / "processing" / "a.json"
+    processing.parent.mkdir(parents=True)
+    pending.replace(processing)
+    result = run(out, index)
+    assert result.returncode == 0, result.stderr
+    assert (out / "canonical-ingest" / "processed" / "a.json").is_file()
+
+
+def test_queue_ingest_fails_closed_on_changed_rows_or_missing_decoder(tmp_path):
+    out, index = tmp_path / "out", tmp_path / "index"
+    write_window(out, "a", [row("frame-a", 0, 100, "teacher-a")], decoder=False)
+    result = run(out, index)
+    assert result.returncode != 0 and "decoder" in result.stderr

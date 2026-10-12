@@ -33,12 +33,38 @@ def sha256(path: Path) -> str:
 def atomic_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    with temporary.open("w") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, path)
 
 
+def publish_incremental_ingest_descriptor(out: Path, receipt_path: Path, receipt: dict) -> None:
+    """Publish a tiny, immutable work item after the window receipt is durable.
+
+    The canonical ingester consumes this queue rather than globbing and
+    re-hashing every historical receipt on every timer run.  It is deliberately
+    published *after* the materializer receipt so a descriptor can never point
+    at a half-written scientific artifact.
+    """
+    descriptor = {
+        "schema": SCHEMA + "_INGEST_DESCRIPTOR_V1",
+        "window_id": receipt["window_id"],
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256(receipt_path),
+        "market_rows_sha256": receipt["market_rows_sha256"],
+    }
+    atomic_json(out / "canonical-ingest" / "pending" / f"{receipt['window_id']}.json", descriptor)
+
+
 def source_partition_refs(window: Path) -> list[dict[str, str]]:
-    """Bind a derived window to immutable partition manifests without copying raw."""
+    """Bind a derived window to the immutable partition manifests it decoded.
+
+    The source payload is deliberately not copied again.  The receipt records
+    the manifest identity and the sealed compressed-object identity so a later
+    consumer can verify the exact raw evidence independently.
+    """
     references: list[dict[str, str]] = []
     partition_root = window / "partitions"
     for manifest_path in sorted(partition_root.glob("**/manifest.json")):
@@ -321,6 +347,8 @@ def main() -> None:
         eligible = windows(args.root, completed)
         if args.not_before_window_id:
             eligible = [entry for entry in eligible if entry[0] >= args.not_before_window_id]
+    # A remembered ID is not proof that its output remains intact.  Revalidate
+    # the durable receipt and content hash before reusing it after a restart.
     corrupt_processed = [entry[0] for entry in eligible if entry[0] in processed
                          and not verified_processed_receipt(args.out, entry[0])]
     if corrupt_processed:
@@ -355,7 +383,9 @@ def main() -> None:
             "outcome_blind": True,
             "pnl_accessed": False,
         }
-        atomic_json(args.out / "receipts" / f"{window_id}.json", receipt)
+        receipt_path = args.out / "receipts" / f"{window_id}.json"
+        atomic_json(receipt_path, receipt)
+        publish_incremental_ingest_descriptor(args.out, receipt_path, receipt)
         processed.add(window_id)
         state = {"schema": SCHEMA + "_STATE_V1", "processed": sorted(processed), "outcome_blind": True}
         atomic_json(state_path, state)

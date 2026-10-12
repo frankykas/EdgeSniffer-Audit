@@ -1,6 +1,6 @@
 # kEfi Audit Remediation Status
 
-Last reconciled: 2026-10-12 03:18 EDT (2026-10-12T07:18Z) against the live VPS.
+Last reconciled: 2026-10-12 03:28 EDT (2026-10-12T07:28Z) against the live VPS.
 
 This is a status ledger, not a claim that the research is ready for live trading.
 `VERIFIED` means checked against the live host or an executable test. `IMPLEMENTED`
@@ -43,8 +43,10 @@ uses durable record-then-journal publication, recovers only a fully valid
 orphan record after interruption, and rejects duplicate/tampered records.
 Eligibility tests reject H1-opened, H2-quarantined, operational and
 pre-boundary evidence, while allowing post-boundary FUTURE_UNOPENED evidence.
-It is not yet integrated into materialization or boundary creation, and no
-epoch record has been used to create a cohort.
+The separately tested cohort-admission guard calls this policy using real UTC
+parsing, including exact fractional-second boundaries. It is not yet wired into
+materialization or boundary creation, and no epoch record has been used to
+create a cohort.
 
 ### 2. Actual materializer regression suite
 
@@ -104,7 +106,9 @@ materializer descriptors, verifies the receipt/rows/source bindings once,
 separates intrinsic source-event identity from window exposure, and recovers a
 claimed-but-unfinished descriptor safely. Its local regressions prove that a
 normal subsequent run does not require old receipts. It is deliberately not
-yet wired to the live materializer timer. Compact research-table publication
+yet enabled on the live materializer timer. A separate low-priority systemd
+runner was installed but remains disabled; its isolated VPS queue/recovery
+smoke passed without touching capture. Compact research-table publication
 and an operational equivalence/restart proof remain required; periodic full
 integrity scrubs must remain outside the hot append path.
 
@@ -128,9 +132,13 @@ authenticated pre-decode input descriptor.
 
 ### 8. Temporal/actionability and paper-mechanics audit
 
-**Status: OPEN.**
+**Status: PARTIALLY AUDITED; FROZEN SIMULATION CONTRACT OPEN.**
 
-Before H3 discovery, audit same-slot ordering, `available_at_ns`, entry delay,
+A bounded 182,339-row / 70,365-source-event audit found no malformed identity,
+fee, or conflicting-event defects and established that `event_timestamp` is
+later than source receipt in every sampled row. Any future simulator must use
+`received_at_unix_ns` as its actionability clock, not chain event time. Before
+H3 discovery, still audit same-slot ordering/tie-breaks, fixed entry delay,
 AMM fee/slippage arithmetic, non-tradeable outcomes, exits, and clustering.
 No claim about a predictive/economic fingerprint may be made before this is
 complete.

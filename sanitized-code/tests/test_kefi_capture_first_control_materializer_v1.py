@@ -1,10 +1,19 @@
 import json
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 
 MATERIALIZER = Path(__file__).parents[1] / "scripts" / "kefi_capture_first_control_materializer_v1.py"
+
+
+def materializer_module():
+    spec = importlib.util.spec_from_file_location("kefi_materializer", MATERIALIZER)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def row(candidate_signature: str, source_frame_sha256: str, pool_quote_raw: int) -> dict:
@@ -64,3 +73,47 @@ def test_conflicting_source_frame_overlap_fails_closed(tmp_path):
     result = rebuild(tmp_path)
     assert result.returncode != 0
     assert "FAIL_CLOSED: conflicting source-frame overlap" in result.stderr
+
+
+def test_processed_window_requires_matching_receipt_and_rows_hash(tmp_path):
+    module = materializer_module()
+    out = tmp_path / "out"
+    rows = out / "market-rows" / "window-a.jsonl"
+    rows.parent.mkdir(parents=True)
+    rows.write_text('{"source_frame_sha256":"frame-a","event_index":0}\n')
+    receipt = out / "receipts" / "window-a.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({
+        "window_id": "window-a",
+        "market_rows_path": str(rows),
+        "market_rows_sha256": module.sha256(rows),
+    }))
+    assert module.verified_processed_receipt(out, "window-a")
+    rows.write_text('{"source_frame_sha256":"frame-a","event_index":1}\n')
+    assert not module.verified_processed_receipt(out, "window-a")
+
+
+def test_source_partition_refs_bind_manifest_and_compressed_identity(tmp_path):
+    module = materializer_module()
+    window = tmp_path / "window"
+    partition = window / "partitions" / "2026" / "10" / "12" / "00"
+    partition.mkdir(parents=True)
+    (partition / "evidence.frames.zst").write_bytes(b"evidence")
+    (partition / "manifest.json").write_text(json.dumps({"compressedSha256": "abc"}))
+    assert module.source_partition_refs(window) == [{
+        "relative_manifest_path": "partitions/2026/10/12/00/manifest.json",
+        "manifest_sha256": module.sha256(partition / "manifest.json"),
+        "compressed_sha256": "abc",
+    }]
+
+
+def test_ingest_descriptor_is_published_only_after_receipt_is_durable(tmp_path):
+    module = materializer_module()
+    out = tmp_path / "out"
+    receipt_path = out / "receipts" / "window-a.json"
+    receipt = {"window_id": "window-a", "market_rows_sha256": "rows-hash"}
+    module.atomic_json(receipt_path, receipt)
+    module.publish_incremental_ingest_descriptor(out, receipt_path, receipt)
+    descriptor = json.loads((out / "canonical-ingest" / "pending" / "window-a.json").read_text())
+    assert descriptor["receipt_sha256"] == module.sha256(receipt_path)
+    assert descriptor["market_rows_sha256"] == "rows-hash"
