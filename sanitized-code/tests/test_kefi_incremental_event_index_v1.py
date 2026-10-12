@@ -44,8 +44,8 @@ def write_window(out: Path, window_id: str, rows: list[dict], *, decoder=True) -
     return receipt_path
 
 
-def run(out: Path, index: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(INDEXER), "--materializer-out", str(out), "--index-root", str(index)], text=True, capture_output=True)
+def run(out: Path, index: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, str(INDEXER), "--materializer-out", str(out), "--index-root", str(index), *extra], text=True, capture_output=True)
 
 
 def checkpoint(index: Path) -> dict:
@@ -92,3 +92,19 @@ def test_queue_ingest_fails_closed_on_changed_rows_or_missing_decoder(tmp_path):
     write_window(out, "a", [row("frame-a", 0, 100, "teacher-a")], decoder=False)
     result = run(out, index)
     assert result.returncode != 0 and "decoder" in result.stderr
+
+
+def test_explicit_canonical_export_is_identical_across_replay_and_restart(tmp_path):
+    first_out, second_out = tmp_path / "first", tmp_path / "second"
+    for out in (first_out, second_out):
+        write_window(out, "a", [row("frame", 0, 100, "teacher-a")])
+        write_window(out, "b", [row("frame", 0, 100, "teacher-b"), row("frame-b", 1, 200, "teacher-b")])
+    assert run(first_out, tmp_path / "index-a", "--export-canonical").returncode == 0
+    # Simulate a process restart with one descriptor already claimed.
+    pending = second_out / "canonical-ingest" / "pending" / "a.json"
+    processing = second_out / "canonical-ingest" / "processing" / "a.json"; processing.parent.mkdir(parents=True)
+    pending.replace(processing)
+    assert run(second_out, tmp_path / "index-b", "--export-canonical").returncode == 0
+    a = json.loads((tmp_path / "index-a" / "canonical-export-v1" / "manifest.json").read_text())
+    b = json.loads((tmp_path / "index-b" / "canonical-export-v1" / "manifest.json").read_text())
+    assert a == b

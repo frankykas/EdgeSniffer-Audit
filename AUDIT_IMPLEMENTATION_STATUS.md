@@ -1,6 +1,6 @@
 # kEfi Audit Remediation Status
 
-Last reconciled: 2026-10-12 03:28 EDT (2026-10-12T07:28Z) against the live VPS.
+Last reconciled: 2026-10-12 03:43 EDT (2026-10-12T07:43Z) against the live VPS.
 
 This is a status ledger, not a claim that the research is ready for live trading.
 `VERIFIED` means checked against the live host or an executable test. `IMPLEMENTED`
@@ -24,7 +24,7 @@ claim has been made and no H3 paper boundary may rely on it.
 
 ### 1. Quarantine scientific epochs
 
-**Status: REGISTRY PRIMITIVE, RECOVERY, AND ELIGIBILITY POLICY TESTED; PIPELINE INTEGRATION OPEN.**
+**Status: STRICT REGISTRY POLICY TESTED; PIPELINE INTEGRATION OPEN.**
 
 The following must become durable registry records before H3 discovery/fresh
 collection:
@@ -41,8 +41,10 @@ new boundary, and no H1-opened outcome can be relabeled as confirmation.
 The registry serializes appends, verifies the existing chain before append,
 uses durable record-then-journal publication, recovers only a fully valid
 orphan record after interruption, and rejects duplicate/tampered records.
-Eligibility tests reject H1-opened, H2-quarantined, operational and
-pre-boundary evidence, while allowing post-boundary FUTURE_UNOPENED evidence.
+Eligibility requires membership in exactly one post-boundary
+`FUTURE_UNOPENED`/`UNOPENED` epoch. H1-opened, H2-quarantined, operational,
+pre-boundary, gap, overlapping-epoch ambiguity, and invalid kind/status cases
+are rejected. A post-boundary future-unopened record is accepted.
 The separately tested cohort-admission guard calls this policy using real UTC
 parsing, including exact fractional-second boundaries. It is not yet wired into
 materialization or boundary creation, and no epoch record has been used to
@@ -108,8 +110,10 @@ claimed-but-unfinished descriptor safely. Its local regressions prove that a
 normal subsequent run does not require old receipts. It is deliberately not
 yet enabled on the live materializer timer. A separate low-priority systemd
 runner was installed but remains disabled; its isolated VPS queue/recovery
-smoke passed without touching capture. Compact research-table publication
-and an operational equivalence/restart proof remain required; periodic full
+smoke passed without touching capture. A two-run isolated VPS proof over
+copied sealed windows produced identical canonical exports after an interrupted
+descriptor claim: 25,406 events and 35,317 exposures. Compact research-table
+publication and a production operational proof remain required; periodic full
 integrity scrubs must remain outside the hot append path.
 
 ### 6. Restart-safe content verification
@@ -132,14 +136,18 @@ authenticated pre-decode input descriptor.
 
 ### 8. Temporal/actionability and paper-mechanics audit
 
-**Status: PARTIALLY AUDITED; FROZEN SIMULATION CONTRACT OPEN.**
+**Status: PARTIALLY AUDITED; FROZEN SIMULATION CONTRACT BLOCKS H3.**
 
 A bounded 182,339-row / 70,365-source-event audit found no malformed identity,
 fee, or conflicting-event defects and established that `event_timestamp` is
 later than source receipt in every sampled row. Any future simulator must use
-`received_at_unix_ns` as its actionability clock, not chain event time. Before
-H3 discovery, still audit same-slot ordering/tie-breaks, fixed entry delay,
-AMM fee/slippage arithmetic, non-tradeable outcomes, exits, and clustering.
+`received_at_unix_ns` as its actionability clock, not chain event time. The
+new contract requires deterministic `durable_output_sequence` ordering for
+equal receipt times and exact raw PumpSwap instruction/event transitions; it
+forbids summed fee-BPS approximation. Current decoded rows lack that sequence,
+so the contract correctly reports `MISSING_DETERMINISTIC_SOURCE_ORDER`.
+Before H3 discovery, add that provenance then audit fixed entry delay,
+non-tradeable outcomes, exits, and clustering.
 No claim about a predictive/economic fingerprint may be made before this is
 complete.
 

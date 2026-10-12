@@ -117,3 +117,17 @@ def test_ingest_descriptor_is_published_only_after_receipt_is_durable(tmp_path):
     descriptor = json.loads((out / "canonical-ingest" / "pending" / "window-a.json").read_text())
     assert descriptor["receipt_sha256"] == module.sha256(receipt_path)
     assert descriptor["market_rows_sha256"] == "rows-hash"
+
+
+def test_cohort_row_validation_rejects_preboundary_evidence(tmp_path):
+    module = materializer_module()
+    registry_script = Path(__file__).parents[1] / "scripts" / "kefi_scientific_epoch_registry_v1.py"
+    spec = importlib.util.spec_from_file_location("epochs", registry_script); epochs = importlib.util.module_from_spec(spec); spec.loader.exec_module(epochs)
+    epochs.append(tmp_path / "registry", {"epoch_id":"future","kind":"FUTURE_UNOPENED","status":"UNOPENED","start_utc":"2026-10-10T00:00:00Z","end_utc":"","reason":"test"})
+    rows = tmp_path / "rows.jsonl"; rows.write_text('{"received_at_unix_ns":1}\n')
+    try:
+        module.validate_cohort_rows(rows, registry_script, tmp_path / "registry", "2026-10-10T00:00:00Z")
+    except RuntimeError as error:
+        assert "PRE_BOUNDARY" in str(error)
+    else:
+        raise AssertionError("pre-boundary row accepted")

@@ -8,7 +8,9 @@ sealed with a COMPLETE promotion receipt.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -89,6 +91,24 @@ def decoder_identity(decoder: Path) -> dict[str, str]:
     if not decoder.is_file():
         raise RuntimeError(f"FAIL_CLOSED: decoder missing {decoder}")
     return {"decoder_path": str(decoder), "decoder_sha256": sha256(decoder)}
+
+
+def validate_cohort_rows(rows_path: Path, registry_script: Path, registry_root: Path, boundary_utc: str) -> None:
+    """Reject any decoded row that is outside the registered future cohort."""
+    spec = importlib.util.spec_from_file_location("kefi_epochs", registry_script)
+    if not spec or not spec.loader:
+        raise RuntimeError("FAIL_CLOSED: cannot load epoch registry")
+    epochs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(epochs)
+    for line_number, line in enumerate(rows_path.read_text().splitlines(), start=1):
+        try:
+            received_ns = int(json.loads(line)["received_at_unix_ns"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"FAIL_CLOSED: invalid cohort row {line_number}") from error
+        timestamp = dt.datetime.fromtimestamp(
+            received_ns / 1_000_000_000, tz=dt.timezone.utc
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        epochs.eligible(registry_root, timestamp, boundary_utc)
 
 
 def verified_processed_receipt(out: Path, window_id: str) -> bool:
@@ -317,8 +337,14 @@ def main() -> None:
     parser.add_argument("--skip-deduplicated-market", action="store_true")
     parser.add_argument("--rebuild-deduplicated-market", action="store_true")
     parser.add_argument("--window-id")
+    parser.add_argument("--registry-script", type=Path)
+    parser.add_argument("--registry-root", type=Path)
+    parser.add_argument("--boundary-utc")
     parser.add_argument("--list-eligible", action="store_true")
     args = parser.parse_args()
+    cohort_args = (args.registry_script, args.registry_root, args.boundary_utc)
+    if any(cohort_args) and not all(cohort_args):
+        raise SystemExit("FAIL_CLOSED: registry-script, registry-root, and boundary-utc are required together")
 
     if not args.rebuild_deduplicated_market and not args.decoder.is_file():
         raise SystemExit("FAIL_CLOSED: decoder missing")
@@ -369,7 +395,14 @@ def main() -> None:
     for window_id, window, manifest in eligible:
         destination = args.out / "market-rows" / f"{window_id}.jsonl"
         destination.parent.mkdir(parents=True, exist_ok=True)
-        summary = decode_window(args.decoder, window_id, window, destination, args.cache_root)
+        try:
+            summary = decode_window(args.decoder, window_id, window, destination, args.cache_root)
+            if args.registry_script:
+                validate_cohort_rows(destination, args.registry_script, args.registry_root, args.boundary_utc)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(".summary.json").unlink(missing_ok=True)
+            raise
         receipt = {
             "schema": SCHEMA + "_WINDOW_RECEIPT_V1",
             "window_id": window_id,

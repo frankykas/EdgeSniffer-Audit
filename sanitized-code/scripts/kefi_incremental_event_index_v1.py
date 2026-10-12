@@ -208,11 +208,42 @@ def checkpoint(connection: sqlite3.Connection, database: Path, index_root: Path,
     return events, windows
 
 
+def export_canonical(connection: sqlite3.Connection, index_root: Path) -> dict:
+    """Explicit deterministic export for equivalence/restart certification.
+
+    This is intentionally not part of the timer path: it walks the index by
+    design and is therefore a bounded certification operation, not ingestion.
+    """
+    export_root = index_root / "canonical-export-v1"
+    export_root.mkdir(parents=True, exist_ok=True)
+    events_path = export_root / "events.jsonl"
+    exposures_path = export_root / "window-exposures.jsonl"
+    for path, query in [
+        (events_path, "SELECT source_frame_sha256,event_index,intrinsic_canonical,received_at_unix_ns,slot FROM events ORDER BY received_at_unix_ns,slot,source_frame_sha256,event_index"),
+        (exposures_path, "SELECT window_id,source_frame_sha256,event_index,exposure_canonical FROM window_events ORDER BY window_id,source_frame_sha256,event_index"),
+    ]:
+        temporary = path.with_name(f".{path.name}.tmp")
+        with temporary.open("w") as handle:
+            for row in connection.execute(query):
+                handle.write(canonical(dict(zip(("source_frame_sha256", "event_index", "intrinsic_canonical", "received_at_unix_ns", "slot") if path == events_path else ("window_id", "source_frame_sha256", "event_index", "exposure_canonical"), row))) + "\n")
+            handle.flush(); os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    manifest = {
+        "schema": SCHEMA + "_CANONICAL_EXPORT_V1",
+        "events_sha256": sha256(events_path), "window_exposures_sha256": sha256(exposures_path),
+        "events": connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+        "window_exposures": connection.execute("SELECT COUNT(*) FROM window_events").fetchone()[0],
+    }
+    atomic_json(export_root / "manifest.json", manifest)
+    return manifest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--materializer-out", type=Path, required=True)
     parser.add_argument("--index-root", type=Path, required=True)
     parser.add_argument("--queue-root", type=Path)
+    parser.add_argument("--export-canonical", action="store_true")
     args = parser.parse_args()
     queue_root = args.queue_root or args.materializer_out / "canonical-ingest"
     database = args.index_root / "market-events-v2.sqlite"
@@ -229,9 +260,11 @@ def main() -> None:
             os.replace(descriptor_path, processed / descriptor_path.name)
             fsync_directory(processing); fsync_directory(processed)
         events, _ = checkpoint(connection, database, args.index_root, new, duplicates)
+        exported = export_canonical(connection, args.index_root) if args.export_canonical else None
     finally:
         connection.close()
-    print(json.dumps({"canonical_events": events, "new_events": new, "verified_identical_overlaps": duplicates}, sort_keys=True))
+    print(json.dumps({"canonical_events": events, "new_events": new, "verified_identical_overlaps": duplicates,
+                      "canonical_export": exported}, sort_keys=True))
 
 
 if __name__ == "__main__":

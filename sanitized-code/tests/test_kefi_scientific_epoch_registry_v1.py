@@ -47,7 +47,7 @@ def test_duplicate_or_tampered_epoch_fails_closed(tmp_path):
     try:
         epochs.verify(tmp_path)
     except RuntimeError as error:
-        assert "hash chain mismatch" in str(error)
+        assert "FAIL_CLOSED" in str(error)
     else:
         raise AssertionError("tampered journal was accepted")
 
@@ -82,3 +82,31 @@ def test_exact_fractional_timestamp_boundary_is_not_pre_boundary(tmp_path):
     epochs.append(tmp_path, {"epoch_id": "future", "kind": "FUTURE_UNOPENED", "status": "UNOPENED",
                              "start_utc": "2026-10-10T06:00:00Z", "end_utc": "", "reason": "test"})
     epochs.eligible(tmp_path, "2026-10-10T06:00:00.000000Z", "2026-10-10T06:00:00Z")
+
+
+def test_eligibility_requires_exactly_one_future_unopened_epoch(tmp_path):
+    epochs = module()
+    def add(epoch_id, kind, status, start, end=""):
+        epochs.append(tmp_path, {"epoch_id": epoch_id, "kind": kind, "status": status,
+                                 "start_utc": start, "end_utc": end, "reason": "test"})
+    add("future-a", "FUTURE_UNOPENED", "UNOPENED", "2026-10-10T00:00:00Z", "2026-10-10T01:00:00Z")
+    for at, boundary, expected in [("2026-10-09T23:59:59Z", "2026-10-10T00:00:00Z", "PRE_BOUNDARY"),
+                                   ("2026-10-10T01:30:00Z", "2026-10-09T00:00:00Z", "GAP")]:
+        try: epochs.eligible(tmp_path, at, boundary)
+        except RuntimeError as error: assert expected in str(error)
+        else: raise AssertionError("invalid membership accepted")
+    add("future-b", "FUTURE_UNOPENED", "UNOPENED", "2026-10-10T00:30:00Z", "2026-10-10T02:00:00Z")
+    try: epochs.eligible(tmp_path, "2026-10-10T00:45:00Z", "2026-10-09T00:00:00Z")
+    except RuntimeError as error: assert "AMBIGUOUS" in str(error)
+    else: raise AssertionError("overlap accepted")
+
+
+def test_invalid_kind_status_combination_fails_closed(tmp_path):
+    epochs = module()
+    try:
+        epochs.append(tmp_path, {"epoch_id": "bad", "kind": "FUTURE_UNOPENED", "status": "QUARANTINED",
+                                 "start_utc": "2026-10-10T00:00:00Z", "end_utc": "", "reason": "test"})
+    except RuntimeError as error:
+        assert "kind/status" in str(error)
+    else:
+        raise AssertionError("invalid kind/status accepted")

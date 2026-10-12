@@ -14,6 +14,13 @@ from pathlib import Path
 SCHEMA = "KEFI_SCIENTIFIC_EPOCH_REGISTRY_V1"
 KINDS = {"HISTORICAL_DEVELOPMENT", "H1_OPENED", "H2_QUARANTINED", "OPERATIONAL", "FUTURE_UNOPENED"}
 STATUSES = {"DEVELOPMENT_ONLY", "QUARANTINED", "OPERATIONAL_ONLY", "UNOPENED"}
+VALID_KIND_STATUS = {
+    "HISTORICAL_DEVELOPMENT": "DEVELOPMENT_ONLY",
+    "H1_OPENED": "DEVELOPMENT_ONLY",
+    "H2_QUARANTINED": "QUARANTINED",
+    "OPERATIONAL": "OPERATIONAL_ONLY",
+    "FUTURE_UNOPENED": "UNOPENED",
+}
 
 
 def canonical(value: object) -> bytes:
@@ -60,6 +67,7 @@ def append(registry: Path, payload: dict) -> dict:
         verify(registry)
         journal = registry / "epochs.jsonl"
         rows = load_lines(journal)
+        validate_payload(payload)
         if any(row["epoch_id"] == payload["epoch_id"] for row in rows):
             raise RuntimeError(f"FAIL_CLOSED: epoch already exists {payload['epoch_id']}")
         previous = rows[-1]["record_sha256"] if rows else ""
@@ -85,6 +93,7 @@ def append(registry: Path, payload: dict) -> dict:
 def verify(registry: Path) -> None:
     previous = ""
     for record in load_lines(registry / "epochs.jsonl"):
+        validate_payload(record)
         claimed = record.pop("record_sha256")
         if record.get("previous_record_sha256") != previous or digest(record) != claimed:
             raise RuntimeError("FAIL_CLOSED: epoch registry hash chain mismatch")
@@ -117,13 +126,33 @@ def recover(registry: Path) -> None:
 def eligible(registry: Path, at_utc: str, boundary_utc: str) -> None:
     verify(registry)
     at = parse_utc(at_utc)
-    if at < parse_utc(boundary_utc):
+    boundary = parse_utc(boundary_utc)
+    if at < boundary:
         raise RuntimeError("INELIGIBLE_PRE_BOUNDARY")
+    matching = []
     for record in load_lines(registry / "epochs.jsonl"):
+        validate_payload(record)
         start = parse_utc(record["start_utc"])
         end = parse_utc(record.get("end_utc") or "9999-12-31T23:59:59Z")
-        if start <= at <= end and record["status"] != "UNOPENED":
-            raise RuntimeError(f"INELIGIBLE_EPOCH_{record['kind']}")
+        if start <= at <= end:
+            matching.append(record)
+    if not matching:
+        raise RuntimeError("INELIGIBLE_EPOCH_GAP")
+    if len(matching) != 1:
+        raise RuntimeError("INELIGIBLE_EPOCH_AMBIGUOUS")
+    record = matching[0]
+    if record["kind"] != "FUTURE_UNOPENED" or record["status"] != "UNOPENED":
+        raise RuntimeError(f"INELIGIBLE_EPOCH_{record['kind']}")
+
+
+def validate_payload(payload: dict) -> None:
+    kind, status = payload.get("kind"), payload.get("status")
+    if kind not in KINDS or status not in STATUSES or VALID_KIND_STATUS.get(kind) != status:
+        raise RuntimeError("FAIL_CLOSED: invalid epoch kind/status combination")
+    start = parse_utc(str(payload.get("start_utc", "")))
+    end_text = str(payload.get("end_utc") or "")
+    if end_text and parse_utc(end_text) < start:
+        raise RuntimeError("FAIL_CLOSED: epoch end precedes start")
 
 
 def parse_utc(value: str) -> dt.datetime:
