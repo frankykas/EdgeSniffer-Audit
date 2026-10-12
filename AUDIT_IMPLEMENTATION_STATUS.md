@@ -24,7 +24,7 @@ claim has been made and no H3 paper boundary may rely on it.
 
 ### 1. Quarantine scientific epochs
 
-**Status: REGISTRY PRIMITIVE TESTED; ENFORCEMENT OPEN.**
+**Status: REGISTRY PRIMITIVE AND ELIGIBILITY POLICY TESTED; PIPELINE INTEGRATION OPEN.**
 
 The following must become durable registry records before H3 discovery/fresh
 collection:
@@ -38,9 +38,12 @@ collection:
 Required invariant: no fresh H3 result can consume evidence earlier than its
 new boundary, and no H1-opened outcome can be relabeled as confirmation.
 
-An append-only hash-chained registry primitive now exists and rejects duplicate
-or tampered records in tests. It is not yet integrated into materialization or
-boundary creation, and no epoch record has been used to create a cohort.
+The registry serializes appends, verifies the existing chain before append,
+uses durable record-then-journal publication, and rejects duplicate/tampered
+records. Eligibility tests reject H1-opened, H2-quarantined, operational and
+pre-boundary evidence, while allowing post-boundary FUTURE_UNOPENED evidence.
+It is not yet integrated into materialization or boundary creation, and no
+epoch record has been used to create a cohort.
 
 ### 2. Actual materializer regression suite
 
