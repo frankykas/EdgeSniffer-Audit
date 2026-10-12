@@ -35,12 +35,14 @@ Authoritative live-proof artifacts on the VPS:
   `82e1fb6e0a15acf25b930ba7ee48adbf1932adaec997388b7bffdf4a21a84804`
 
 The former H3 proposal was correctly reclassified: it was an actionability
-qualification, not an answer to H1's economic failure.  The only immediate
-proposed study is now
+qualification, not an answer to H1's economic failure.  The approved immediate
+study is now
 `sanitized-code/KEFI_PRE_H3_ACTIONABILITY_QUALIFICATION_V1_SPEC_FOR_INDEPENDENT_AUDIT.md`.
-It needs independent review before a **pre-H3 qualification** boundary is
-written.  A real H3 remains blocked pending separate offline discovery of one
-new post-H1 economic hypothesis and its own independent review.
+Its specification is approved; the newly implemented deterministic assignment
+builder still needs final independent audit before a **pre-H3 qualification**
+boundary is written. A real H3 remains blocked pending separate offline
+discovery of one new post-H1 economic hypothesis and its own independent
+review.
 
 The qualification now has an executable frozen control matcher and evaluator.
 Controls require identical source instance/epoch, 20-second availability
@@ -217,10 +219,10 @@ advantage over controls. Selection AUC is diagnostic, not the objective.
 
 ### 10. Pre-H3 qualification, then fresh H3 paper/control gate
 
-**Status: PRE-H3 QUALIFICATION SPECIFICATION PROPOSED; TRUE H3 BLOCKED BY
-DISCOVERY.**
+**Status: PRE-H3 QUALIFICATION SPECIFICATION APPROVED; ASSIGNMENT-BUILDER
+FINAL AUDIT PENDING; TRUE H3 BLOCKED BY DISCOVERY.**
 
-The proposed pre-H3 qualification has a fixed all-target denominator and a
+The approved pre-H3 qualification has a fixed all-target denominator and a
 cluster-aware actionability endpoint. It cannot be renamed H3 or used for
 economic claims. A true H3 starts only after the tournament selects one novel
 post-H1 economic hypothesis, that hypothesis is preregistered, and a clean
