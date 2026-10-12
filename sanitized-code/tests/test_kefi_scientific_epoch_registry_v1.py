@@ -28,8 +28,10 @@ def record(epoch_id: str) -> dict:
 
 def test_registry_is_hash_chained_and_append_only(tmp_path):
     epochs = module()
-    first = epochs.append(tmp_path, record("one"))
-    second = epochs.append(tmp_path, record("two"))
+    first_payload = record("one"); first_payload["end_utc"] = "2026-10-12T00:00:01Z"
+    second_payload = record("two"); second_payload["start_utc"] = "2026-10-12T00:00:02Z"
+    first = epochs.append(tmp_path, first_payload)
+    second = epochs.append(tmp_path, second_payload)
     assert second["previous_record_sha256"] == first["record_sha256"]
     epochs.verify(tmp_path)
     assert (tmp_path / "records" / "one.json").read_text()
@@ -97,10 +99,8 @@ def test_eligibility_requires_exactly_one_future_unopened_epoch(tmp_path):
         try: epochs.eligible(tmp_path, at, boundary)
         except RuntimeError as error: assert expected in str(error)
         else: raise AssertionError("invalid membership accepted")
-    add("future-b", "FUTURE_UNOPENED", "UNOPENED", "2026-10-10T00:30:00Z", "2026-10-10T02:00:00Z")
-    try: epochs.eligible(tmp_path, "2026-10-10T00:45:00Z", "2026-10-09T00:00:00Z")
-    except RuntimeError as error: assert "AMBIGUOUS" in str(error)
-    else: raise AssertionError("overlap accepted")
+    with pytest.raises(RuntimeError, match="overlapping epoch membership"):
+        add("future-b", "FUTURE_UNOPENED", "UNOPENED", "2026-10-10T00:30:00Z", "2026-10-10T02:00:00Z")
 
 
 def test_invalid_kind_status_combination_fails_closed(tmp_path):
@@ -123,5 +123,24 @@ def test_voided_future_epoch_is_wholly_ineligible_and_closure_is_verified(tmp_pa
     epochs.verify(tmp_path)
     with pytest.raises(RuntimeError, match="VOID"):
         epochs.eligible(tmp_path, "2026-10-10T00:30:00Z", "2026-10-10T00:00:00Z")
-    with pytest.raises(RuntimeError, match="VOID"):
+    with pytest.raises(RuntimeError, match="GAP"):
         epochs.eligible(tmp_path, "2026-10-10T01:30:00Z", "2026-10-10T00:00:00Z")
+
+
+def test_voided_open_epoch_does_not_poison_later_clean_future_epoch(tmp_path):
+    epochs = module()
+    epochs.append(tmp_path, {"epoch_id": "old", "kind": "FUTURE_UNOPENED", "status": "UNOPENED",
+                             "start_utc": "2026-10-10T00:00:00Z", "end_utc": "", "reason": "test"})
+    epochs.void_epoch(tmp_path, "old", "2026-10-10T01:00:00Z", "hard-wall")
+    # The append-only old record remains present, but its closure creates a
+    # non-bridging effective end. The clean epoch begins strictly afterwards.
+    epochs.append(tmp_path, {"epoch_id": "new", "kind": "FUTURE_UNOPENED", "status": "UNOPENED",
+                             "start_utc": "2026-10-10T02:00:00Z", "end_utc": "", "reason": "new-boundary"})
+    with pytest.raises(RuntimeError, match="VOID"):
+        epochs.eligible(tmp_path, "2026-10-10T00:30:00Z", "2026-10-10T00:00:00Z")
+    with pytest.raises(RuntimeError, match="GAP"):
+        epochs.eligible(tmp_path, "2026-10-10T01:30:00Z", "2026-10-10T00:00:00Z")
+    epochs.eligible(tmp_path, "2026-10-10T02:30:00Z", "2026-10-10T02:00:00Z")
+    with pytest.raises(RuntimeError, match="overlapping epoch membership"):
+        epochs.append(tmp_path, {"epoch_id": "ambiguous", "kind": "FUTURE_UNOPENED", "status": "UNOPENED",
+                                 "start_utc": "2026-10-10T02:00:00Z", "end_utc": "", "reason": "bad"})

@@ -74,6 +74,7 @@ def append(registry: Path, payload: dict) -> dict:
         validate_payload(payload)
         if any(row["epoch_id"] == payload["epoch_id"] for row in rows):
             raise RuntimeError(f"FAIL_CLOSED: epoch already exists {payload['epoch_id']}")
+        assert_non_overlapping_epoch(rows, closures(registry), payload)
         previous = rows[-1]["record_sha256"] if rows else ""
         record = {"schema": SCHEMA, **payload, "previous_record_sha256": previous}
         record["record_sha256"] = digest(record)
@@ -166,13 +167,43 @@ def verify(registry: Path) -> None:
         if disk_claimed != claimed or digest(disk_payload) != claimed:
             raise RuntimeError("FAIL_CLOSED: epoch registry record publication mismatch")
         previous = claimed
-    known = {row["epoch_id"]: row for row in load_lines(registry / "epochs.jsonl")}
-    for epoch_id, closure in closures(registry).items():
+    rows = load_lines(registry / "epochs.jsonl")
+    known = {row["epoch_id"]: row for row in rows}
+    closed = closures(registry)
+    for epoch_id, closure in closed.items():
         target = known.get(epoch_id)
         if target is None or closure.get("target_record_sha256") != target.get("record_sha256"):
             raise RuntimeError("FAIL_CLOSED: closure target mismatch")
         if parse_utc(closure["closed_at_utc"]) < parse_utc(target["start_utc"]):
             raise RuntimeError("FAIL_CLOSED: closure precedes epoch start")
+    assert_non_overlapping_existing_epochs(rows, closed)
+
+
+def effective_end(record: dict, closed: dict[str, dict]) -> dt.datetime:
+    """A voided epoch ends at its durable closure for membership checks only."""
+    closure = closed.get(str(record["epoch_id"]))
+    if closure:
+        return parse_utc(closure["closed_at_utc"])
+    end_text = str(record.get("end_utc") or "")
+    return parse_utc(end_text) if end_text else dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+
+
+def assert_non_overlapping_existing_epochs(rows: list[dict], closed: dict[str, dict]) -> None:
+    ordered = sorted(rows, key=lambda item: parse_utc(item["start_utc"]))
+    for left, right in zip(ordered, ordered[1:]):
+        if parse_utc(right["start_utc"]) <= effective_end(left, closed):
+            raise RuntimeError("FAIL_CLOSED: overlapping epoch membership")
+
+
+def assert_non_overlapping_epoch(rows: list[dict], closed: dict[str, dict], candidate: dict) -> None:
+    candidate_start = parse_utc(candidate["start_utc"])
+    candidate_end_text = str(candidate.get("end_utc") or "")
+    candidate_end = parse_utc(candidate_end_text) if candidate_end_text else dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    for existing in rows:
+        start = parse_utc(existing["start_utc"])
+        end = effective_end(existing, closed)
+        if candidate_start <= end and start <= candidate_end:
+            raise RuntimeError("FAIL_CLOSED: overlapping epoch membership")
 
 
 def recover(registry: Path) -> None:
@@ -221,7 +252,7 @@ def eligible(registry: Path, at_utc: str, boundary_utc: str) -> None:
         # A closure is a cohort void, not a permissive end timestamp.  Its
         # historical contents remain auditable but are never eligible again.
         if record["epoch_id"] in closed:
-            if parse_utc(record["start_utc"]) <= at:
+            if parse_utc(record["start_utc"]) <= at <= parse_utc(closed[record["epoch_id"]]["closed_at_utc"]):
                 voided_match = True
             continue
         start = parse_utc(record["start_utc"])

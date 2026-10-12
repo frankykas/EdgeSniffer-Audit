@@ -56,23 +56,28 @@ are references for an auditor with authorized access to the retained evidence.
 
 The original remediated deployment manifest was
 `18ddb32a818becb8c0827cf633d640a85ef22164d09068d0079064ba69bff89d`.
-The explicit-void-diagnostic remediation bundle supersedes it with deployment
-manifest SHA-256
-`df1b0a4626e343fd61b59bcb0d890d91ef3b2e4cc0b1c370e95643d8e2e690aa`.
+The explicit-void-diagnostic remediation bundle was superseded by the final
+non-bridging-void deployment bundle after the complete regression run. Its
+manifest SHA-256 is recorded below with the final component hashes.
+
+Final non-bridging-void deployment manifest SHA-256:
+`f036e37581c481f148a58e825601ff6493683aaaee49bd3b966241a661cb24a4`.
 
 | Component | SHA-256 |
 | --- | --- |
 | Incremental canonical index | `e8139b71c585e0058b7083ce63e712faa85e2961bbfa422f9b6c07c9603577ed` |
 | Qualification assignment builder | `1b78bb03f54a323174ca4c2740197dab2b7e0eba8efa63344c2f389f7e1cc39b` |
-| Scientific epoch registry | `56d12e8e51dba7718c638ecaf858ec8659f8e14dbaefe9001bcfe0ed49fd481f` |
+| Scientific epoch registry | `bff3ed4d5f7e085d0ae4ec72a743a64cdcfa416c11fc02de0e026e69f86499f1` |
 | Qualification runner | `97b32a855d4d493c378828d63b9b779bb492d5317e51ec4b9749c937cd0bd766` |
 | Duplicate forensic helper | `6ff8cacc2e6640c13ed9be66d0f7cbaa96e29064b29fb16953095dcb7cbc6aa9` |
 | Frozen fingerprint artifact | `db08899d92f4d69d8c0234cfff9cbd05bd27dfb1365aed88d08b85f88cfc1b4a` |
+| Frozen machine-readable qualification contract | `d36f78896102456155efcb934321e98394255b155ff38f5c6f8d68636b91e615` |
+| Frozen prose qualification specification | `920ab7e4ccba0d66f5dd8389296acd2e6a07407bba020657eec83bfc702988bf` |
 
 ## Regression state
 
 The complete private regression suite was run after remediation: **75 passed**.
-The sanitized public suite included in this repository was also run: **58
+The sanitized public suite included in this repository was also run: **59
 passed**. Coverage includes canonical/exposure separation, conflicting
 intrinsic identity failure, outcome-field identity invariance, restart-order
 determinism, indexed actionability equivalence, and voided-epoch ineligibility.

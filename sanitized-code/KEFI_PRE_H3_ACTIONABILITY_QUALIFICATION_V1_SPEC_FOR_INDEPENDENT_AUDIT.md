@@ -1,6 +1,6 @@
 # Proposed Pre-H3 Actionability Qualification V1
 
-Status: `APPROVED_PENDING_ASSIGNMENT_BUILDER_FINAL_AUDIT`  
+Status: `APPROVED_CANONICAL_INPUT_REMEDIATED_NO_BOUNDARY`
 Boundary/cohort/result created: `NO`
 
 ## Scope and Hypothesis
@@ -171,9 +171,19 @@ boundary or a cohort.
 
 `scripts/kefi_pre_h3_assignment_builder_v1.py` is the only supported upstream
 publisher for evaluator assignments. It requires a hash-matching frozen base
-fingerprint, an already-written boundary receipt, scientific materialization
-receipts bound to their canonical JSONL, and a verified epoch registry. It
-does not create any of those artifacts.
+fingerprint, an already-written boundary receipt, the canonical intrinsic-event
+JSONL, its hash-bound qualification-input manifest, and a verified append-only
+epoch registry. It does not create any of those artifacts. Concatenating a
+list of scientific receipts is not an accepted assignment-input path.
+
+The canonical index publishes exactly one intrinsic record for each
+`(source_frame_sha256, event_index)` identity in `canonical-events.jsonl`.
+`window-exposures.jsonl` preserves sealed-window multiplicity as provenance
+only. The manifest uses schema
+`KEFI_INCREMENTAL_EVENT_INDEX_V2_QUALIFICATION_INPUT_V1`, hashes both files,
+and declares the frozen policy: `canonical intrinsic events exactly once;
+window multiplicity is provenance only`. Derived/outcome annotations never
+participate in intrinsic identity.
 
 Before delayed entry, non-tradeability, marks, or a horizon are inspected, it
 scores only the frozen pre-entry feature state, admits every match after the
@@ -187,7 +197,7 @@ It derives entry/120-second/hard-wall outcomes only after target/control
 identity is frozen; derives dependency clusters from the frozen source/order
 fields; and assigns eight contiguous equal-event-count chronological blocks.
 The builder publishes a manifest hash-binding the fingerprint, boundary
-receipt, every scientific receipt and canonical row file, epoch registry,
+receipt, canonical-input manifest/events/exposure provenance, epoch registry,
 matcher, builder, evaluator, control seed, and assignment JSONL. The builder
 does not invoke the evaluator and records `outcomes_evaluated: false`.
 
@@ -209,6 +219,13 @@ epoch. A source-instance or continuity-epoch break is a cohort-level hard wall:
 the builder fails closed and does not produce assignments from either side in a
 combined cohort. A later clean run requires a separate approved boundary; no
 cross-break aggregation is permitted.
+
+A voided qualification epoch is permanently ineligible for every timestamp in
+its recorded membership interval through its durable closure. Evidence after
+that closure is a gap until a later separately approved, non-overlapping
+`FUTURE_UNOPENED`/`UNOPENED` epoch begins at a fresh boundary. The old append-
+only record is never deleted, reused, or bridged; it does not prevent the later
+epoch from being eligible on its own timestamps.
 
 ## Explicit Non-Claims and Next Step
 

@@ -20,7 +20,7 @@ is a whole-cohort ineligibility record, not an end-time that permits bridging.
 
 The exact replay produced byte-identical canonical export, exposure provenance,
 and assignment output on two runs. Full private regression status: **75
-passed**; sanitized public regression status: **58 passed**.
+passed**; sanitized public regression status: **59 passed**.
 Component hashes and replay evidence references are in
 [`PRE_H3_VOID_COHORT_REMEDIATION_2026-10-12.md`](PRE_H3_VOID_COHORT_REMEDIATION_2026-10-12.md).
 
@@ -52,14 +52,14 @@ Authoritative live-proof artifacts on the VPS:
   `82e1fb6e0a15acf25b930ba7ee48adbf1932adaec997388b7bffdf4a21a84804`
 
 The former H3 proposal was correctly reclassified: it was an actionability
-qualification, not an answer to H1's economic failure.  The approved immediate
+qualification, not an answer to H1's economic failure. The approved immediate
 study is now
 `sanitized-code/KEFI_PRE_H3_ACTIONABILITY_QUALIFICATION_V1_SPEC_FOR_INDEPENDENT_AUDIT.md`.
-Its specification is approved; the newly implemented deterministic assignment
-builder still needs final independent audit before a **pre-H3 qualification**
-boundary is written. A real H3 remains blocked pending separate offline
-discovery of one new post-H1 economic hypothesis and its own independent
-review.
+Its frozen contract is reconciled to the canonical-input builder/index/registry
+implementation and its regressions are verified. No replacement **pre-H3
+qualification** boundary is authorized or written by this update. A real H3
+remains blocked pending separate offline discovery of one new post-H1 economic
+hypothesis and its own independent review.
 
 The qualification now has an executable frozen control matcher and evaluator.
 Controls require identical source instance/epoch, 20-second availability
@@ -236,8 +236,8 @@ advantage over controls. Selection AUC is diagnostic, not the objective.
 
 ### 10. Pre-H3 qualification, then fresh H3 paper/control gate
 
-**Status: PRE-H3 QUALIFICATION SPECIFICATION APPROVED; ASSIGNMENT-BUILDER
-FINAL AUDIT PENDING; TRUE H3 BLOCKED BY DISCOVERY.**
+**Status: PRE-H3 QUALIFICATION SPECIFICATION/IMPLEMENTATION RECONCILED;
+NO REPLACEMENT BOUNDARY AUTHORIZED; TRUE H3 BLOCKED BY DISCOVERY.**
 
 The approved pre-H3 qualification has a fixed all-target denominator and a
 cluster-aware actionability endpoint. It cannot be renamed H3 or used for
@@ -259,9 +259,8 @@ arbitrary 24-hour test.
 
 ## Immediate Build Order
 
-1. Independently audit the approved qualification specification **and the new
-   deterministic assignment builder**; do not create any boundary until this
-   final implementation audit is approved.
+1. Obtain explicit authorization before creating any replacement qualification
+   boundary; the voided cohort remains permanently excluded.
 2. Run that qualification once, if approved, and report PASS / INCONCLUSIVE /
    REJECT without PnL or strategy tuning.
 3. Generate compact research tables and execute the bounded offline discovery
