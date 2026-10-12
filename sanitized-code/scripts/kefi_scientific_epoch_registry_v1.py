@@ -17,6 +17,15 @@ def verify(root):
   disk=json.loads(path(root,row["epoch_id"]).read_text()); disk_claimed=disk.pop("record_sha256")
   if row.get("previous_record_sha256")!=previous or digest(row)!=claimed or disk_claimed!=claimed or digest(disk)!=claimed: raise RuntimeError("FAIL_CLOSED: epoch registry hash chain mismatch")
   previous=claimed
+def recover(root):
+ journal=root/"epochs.jsonl"; rows=load(journal); known={row["epoch_id"] for row in rows}; previous=rows[-1]["record_sha256"] if rows else ""
+ for candidate in sorted((root/"records").glob("*.json")) if (root/"records").exists() else []:
+  record=json.loads(candidate.read_text())
+  if record["epoch_id"] in known: continue
+  claimed=record.pop("record_sha256")
+  if record.get("previous_record_sha256")!=previous or digest(record)!=claimed: raise RuntimeError("FAIL_CLOSED: unreconciled epoch record")
+  with journal.open("ab") as h:h.write(canonical({**record,"record_sha256":claimed}));h.flush();os.fsync(h.fileno())
+  previous=claimed
 def lock(root):
  deadline=time.monotonic()+10; p=root/".append.lock"
  while True:
@@ -27,7 +36,7 @@ def lock(root):
 def append(root,payload):
  root.mkdir(parents=True,exist_ok=True); fd=lock(root)
  try:
-  verify(root); rows=load(root/"epochs.jsonl")
+  recover(root); verify(root); rows=load(root/"epochs.jsonl")
   if any(x["epoch_id"]==payload["epoch_id"] for x in rows): raise RuntimeError("FAIL_CLOSED: epoch already exists")
   record={"schema":SCHEMA,**payload,"previous_record_sha256":rows[-1]["record_sha256"] if rows else ""}; record["record_sha256"]=digest(record)
   pending=root/"pending"/f"{payload['epoch_id']}.json"; pending.parent.mkdir(parents=True,exist_ok=True)

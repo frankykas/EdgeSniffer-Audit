@@ -1,6 +1,6 @@
 # kEfi Audit Remediation Status
 
-Last reconciled: 2026-10-12 00:44 EDT (2026-10-12T04:44Z) against the live VPS.
+Last reconciled: 2026-10-12 03:18 EDT (2026-10-12T07:18Z) against the live VPS.
 
 This is a status ledger, not a claim that the research is ready for live trading.
 `VERIFIED` means checked against the live host or an executable test. `IMPLEMENTED`
@@ -24,7 +24,7 @@ claim has been made and no H3 paper boundary may rely on it.
 
 ### 1. Quarantine scientific epochs
 
-**Status: REGISTRY PRIMITIVE AND ELIGIBILITY POLICY TESTED; PIPELINE INTEGRATION OPEN.**
+**Status: REGISTRY PRIMITIVE, RECOVERY, AND ELIGIBILITY POLICY TESTED; PIPELINE INTEGRATION OPEN.**
 
 The following must become durable registry records before H3 discovery/fresh
 collection:
@@ -39,8 +39,9 @@ Required invariant: no fresh H3 result can consume evidence earlier than its
 new boundary, and no H1-opened outcome can be relabeled as confirmation.
 
 The registry serializes appends, verifies the existing chain before append,
-uses durable record-then-journal publication, and rejects duplicate/tampered
-records. Eligibility tests reject H1-opened, H2-quarantined, operational and
+uses durable record-then-journal publication, recovers only a fully valid
+orphan record after interruption, and rejects duplicate/tampered records.
+Eligibility tests reject H1-opened, H2-quarantined, operational and
 pre-boundary evidence, while allowing post-boundary FUTURE_UNOPENED evidence.
 It is not yet integrated into materialization or boundary creation, and no
 epoch record has been used to create a cohort.
@@ -92,18 +93,20 @@ be the final catalog for the incremental evidence layer.
 
 ### 5. Retire repeated full-history JSONL dedup
 
-**Status: PROTOTYPE IMPLEMENTED; INTEGRATION AND PERFORMANCE PROPERTY OPEN.**
+**Status: QUEUE-DRIVEN IMPLEMENTATION TESTED; LIVE INTEGRATION OPEN.**
 
 The service runner no longer calls the global deduplicated-market rebuild after
 each bounded cycle. A live four-window bounded cycle completed without that
 rebuild. This removes the immediate repeated-scan hazard.
 
-An incremental SQLite event-index prototype now validates each new receipt and
-enforces canonical source-event identity. It is deliberately not yet wired to
-the runner. In its current prototype form it re-hashes historical receipt rows
-on each invocation, so it is still O(history) I/O. The required next step is
-append-only content-verified ingestion plus compact Parquet/DuckDB canonical
-tables, with periodic integrity scrubs separated from the hot append path.
+A queue-driven SQLite canonical index now consumes only newly published
+materializer descriptors, verifies the receipt/rows/source bindings once,
+separates intrinsic source-event identity from window exposure, and recovers a
+claimed-but-unfinished descriptor safely. Its local regressions prove that a
+normal subsequent run does not require old receipts. It is deliberately not
+yet wired to the live materializer timer. Compact research-table publication
+and an operational equivalence/restart proof remain required; periodic full
+integrity scrubs must remain outside the hot append path.
 
 ### 6. Restart-safe content verification
 
