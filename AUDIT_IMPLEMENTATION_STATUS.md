@@ -7,6 +7,39 @@ This is a status ledger, not a claim that the research is ready for live trading
 means code/config exists but still needs the stated validation. `OPEN` means no
 claim has been made and no H3 paper boundary may rely on it.
 
+## Pre-H3 Mechanics Closure Update (2026-10-12T15:15Z)
+
+**H3 status: READY FOR INDEPENDENT SPECIFICATION AUDIT ONLY.**  No H3
+boundary, cohort, timer, paper result, or live-execution permission has been
+created.
+
+The following new evidence has been produced from one *post-repair* promoted
+window, under an isolated engineering-only `FUTURE_UNOPENED` registry epoch:
+
+| Gate | Status | Durable evidence |
+| --- | --- | --- |
+| Epoch admission mandatory in scientific materialization | VERIFIED | The scientific runner always supplies `--scientific`, registry, and boundary inputs. The paper contract now requires the resulting scientific receipt and binds its row hash; a standalone JSONL cannot pass the contract. |
+| Writer sequence propagated to durable order | VERIFIED | Fresh source rows carry `source_instance_id`, `continuity_epoch`, `durable_output_sequence`, `event_index`, and frame SHA. Canonical order is `(source_instance_id, continuity_epoch, durable_output_sequence, event_index, source_frame_sha256)`. |
+| Tie ordering / restart determinism | VERIFIED | Public regression coverage proves equal receipt timestamps order by durable sequence then event index, and canonical export remains byte-identical when descriptor arrival/recovery order changes. |
+| Exact PumpSwap transition mechanics | VERIFIED | Whole-window mechanics gate checked all 28,725 fresh rows: 28,725 exact transitions; 21,490 supported/tradeable; 7,234 noncanonical quote layouts plus 1 pre-quote-underflow explicitly fail-closed. |
+| Entry delay / exits / controls / clustering | VERIFIED AS MECHANICS, NOT AS PERFORMANCE | The library and regressions enforce positive same-instance/same-epoch delay, observed-state-only exits, deterministic same-layout different-mint controls, and epoch/pool/time-bucket clusters. No outcome, PnL, or predictive result was read. |
+| Fresh source health | VERIFIED AT CHECK | Source instance `2026-10-12T14:59:43.875661353Z-pid533030` reached 1,211,404 frames with zero reconnects, receive errors, continuity gaps, promotion failures, or queue-full events. |
+
+Authoritative live-proof artifacts on the VPS:
+
+- `/mnt/edgesniffer-kefi-hot/kefi-capture-first-live-v8/operations/pre-h3-live-proof-v1/proof.json`
+  `d4b185fe09732b5584066e1b28ef64c0dc39116a5c48329e1b9b75c2e4dcfa92`
+- `.../contract.json`
+  `304a78ee121c2911ffa8d3119ec02919f23af791f8c1dd6f3171743be3b4498d`
+- `.../mechanics-gate.json`
+  `82e1fb6e0a15acf25b930ba7ee48adbf1932adaec997388b7bffdf4a21a84804`
+
+The only remaining pre-H3 action is independent review of the proposed H3
+specification.  The proposal is copied as
+`sanitized-code/KEFI_H3_PROPOSED_SPEC_FOR_INDEPENDENT_AUDIT.md`; its SHA-256
+is `77c974ebd9f80a4f499f8ba1a56cf9cb908841f7f7a6d782b610ceecb7c05952`.
+Approval is required before any new boundary is written.
+
 ## Current Safety State
 
 | Surface | Status | Evidence / consequence |

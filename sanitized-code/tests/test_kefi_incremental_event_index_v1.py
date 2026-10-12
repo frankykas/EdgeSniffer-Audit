@@ -21,6 +21,11 @@ def row(frame: str, event_index: int, quote: int, candidate: str) -> dict:
     }
 
 
+def scientific_row(frame: str, event_index: int, quote: int, candidate: str, sequence: int) -> dict:
+    return {**row(frame, event_index, quote, candidate), "continuity_epoch": 7,
+            "source_instance_id": "source-a", "durable_output_sequence": sequence}
+
+
 def write_window(out: Path, window_id: str, rows: list[dict], *, decoder=True) -> Path:
     rows_path = out / "market-rows" / f"{window_id}.jsonl"
     rows_path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +47,18 @@ def write_window(out: Path, window_id: str, rows: list[dict], *, decoder=True) -
     pending.parent.mkdir(parents=True, exist_ok=True)
     pending.write_text(json.dumps(descriptor, sort_keys=True) + "\n")
     return receipt_path
+
+
+def mark_scientific(out: Path, window_id: str) -> None:
+    receipt_path = out / "receipts" / f"{window_id}.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["scientific_validation"] = {"rows": 1, "source_frames": 1, "ordered_events": 1}
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+    descriptor = out / "canonical-ingest" / "pending" / f"{window_id}.json"
+    if not descriptor.exists():
+        descriptor = out / "canonical-ingest" / "processing" / f"{window_id}.json"
+    payload = json.loads(descriptor.read_text()); payload["receipt_sha256"] = sha256(receipt_path)
+    descriptor.write_text(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def run(out: Path, index: Path, *extra: str) -> subprocess.CompletedProcess[str]:
@@ -108,3 +125,47 @@ def test_explicit_canonical_export_is_identical_across_replay_and_restart(tmp_pa
     a = json.loads((tmp_path / "index-a" / "canonical-export-v1" / "manifest.json").read_text())
     b = json.loads((tmp_path / "index-b" / "canonical-export-v1" / "manifest.json").read_text())
     assert a == b
+
+
+def test_scientific_ingest_requires_receipt_proof_and_source_sequence(tmp_path):
+    out, index = tmp_path / "out", tmp_path / "index"
+    write_window(out, "a", [scientific_row("frame-a", 0, 100, "teacher-a", 9)])
+    assert run(out, index, "--require-scientific-order").returncode != 0
+    mark_scientific(out, "a")
+    result = run(out, index, "--require-scientific-order", "--export-canonical")
+    assert result.returncode == 0, result.stderr
+    export = (index / "canonical-export-v1" / "events.jsonl").read_text()
+    assert '"durable_output_sequence":9' in export
+
+
+def test_scientific_ingest_fails_closed_on_cross_frame_sequence_collision(tmp_path):
+    out, index = tmp_path / "out", tmp_path / "index"
+    write_window(out, "a", [scientific_row("frame-a", 0, 100, "teacher-a", 9)])
+    write_window(out, "b", [scientific_row("frame-b", 0, 200, "teacher-b", 9)])
+    mark_scientific(out, "a"); mark_scientific(out, "b")
+    result = run(out, index, "--require-scientific-order")
+    assert result.returncode != 0
+    assert "conflicting scientific source order" in result.stderr
+
+
+def test_scientific_export_has_stable_full_tie_order_across_restart(tmp_path):
+    """Receipt arrival order cannot affect canonical source-order output."""
+    first_out, second_out = tmp_path / "first", tmp_path / "second"
+    ordered = [
+        scientific_row("frame-a", 1, 100, "teacher-a", 8),
+        scientific_row("frame-b", 0, 100, "teacher-b", 9),
+    ]
+    for out, rows in ((first_out, ordered), (second_out, list(reversed(ordered)))):
+        write_window(out, "window", rows)
+        mark_scientific(out, "window")
+    first = run(first_out, tmp_path / "index-a", "--require-scientific-order", "--export-canonical")
+    assert first.returncode == 0, first.stderr
+    pending = second_out / "canonical-ingest" / "pending" / "window.json"
+    processing = second_out / "canonical-ingest" / "processing" / "window.json"
+    processing.parent.mkdir(parents=True); pending.replace(processing)
+    second = run(second_out, tmp_path / "index-b", "--require-scientific-order", "--export-canonical")
+    assert second.returncode == 0, second.stderr
+    left = (tmp_path / "index-a" / "canonical-export-v1" / "events.jsonl").read_bytes()
+    right = (tmp_path / "index-b" / "canonical-export-v1" / "events.jsonl").read_bytes()
+    assert left == right
+    assert left.find(b'"durable_output_sequence":8') < left.find(b'"durable_output_sequence":9')

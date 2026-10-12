@@ -124,10 +124,29 @@ def test_cohort_row_validation_rejects_preboundary_evidence(tmp_path):
     registry_script = Path(__file__).parents[1] / "scripts" / "kefi_scientific_epoch_registry_v1.py"
     spec = importlib.util.spec_from_file_location("epochs", registry_script); epochs = importlib.util.module_from_spec(spec); spec.loader.exec_module(epochs)
     epochs.append(tmp_path / "registry", {"epoch_id":"future","kind":"FUTURE_UNOPENED","status":"UNOPENED","start_utc":"2026-10-10T00:00:00Z","end_utc":"","reason":"test"})
-    rows = tmp_path / "rows.jsonl"; rows.write_text('{"received_at_unix_ns":1}\n')
+    rows = tmp_path / "rows.jsonl"; rows.write_text(json.dumps({
+        "received_at_unix_ns": 1, "continuity_epoch": 1,
+        "source_instance_id": "source", "durable_output_sequence": 1, "event_index": 0,
+        "source_frame_sha256": "frame",
+    }) + "\n")
     try:
-        module.validate_cohort_rows(rows, registry_script, tmp_path / "registry", "2026-10-10T00:00:00Z")
+        module.validate_scientific_rows(rows, registry_script, tmp_path / "registry", "2026-10-10T00:00:00Z")
     except RuntimeError as error:
         assert "PRE_BOUNDARY" in str(error)
     else:
         raise AssertionError("pre-boundary row accepted")
+
+
+def test_scientific_validation_rejects_missing_or_ambiguous_source_order(tmp_path):
+    module = materializer_module()
+    registry_script = Path(__file__).parents[1] / "scripts" / "kefi_scientific_epoch_registry_v1.py"
+    spec = importlib.util.spec_from_file_location("epochs", registry_script); epochs = importlib.util.module_from_spec(spec); spec.loader.exec_module(epochs)
+    epochs.append(tmp_path / "registry", {"epoch_id":"future","kind":"FUTURE_UNOPENED","status":"UNOPENED","start_utc":"1970-01-01T00:00:00Z","end_utc":"","reason":"test"})
+    rows = tmp_path / "rows.jsonl"
+    rows.write_text(json.dumps({"received_at_unix_ns": 1, "continuity_epoch": 1, "source_instance_id": "source", "durable_output_sequence": 5, "event_index": 0, "source_frame_sha256": "a"}) + "\n" + json.dumps({"received_at_unix_ns": 1, "continuity_epoch": 1, "source_instance_id": "source", "durable_output_sequence": 5, "event_index": 1, "source_frame_sha256": "b"}) + "\n")
+    try:
+        module.validate_scientific_rows(rows, registry_script, tmp_path / "registry", "1970-01-01T00:00:00Z")
+    except RuntimeError as error:
+        assert "source-order collision" in str(error)
+    else:
+        raise AssertionError("ambiguous source order accepted")

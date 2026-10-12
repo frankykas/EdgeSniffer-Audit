@@ -76,7 +76,30 @@ def connection_for(path: Path) -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS events ("
         "source_frame_sha256 TEXT NOT NULL, event_index INTEGER NOT NULL, intrinsic_canonical TEXT NOT NULL, "
         "received_at_unix_ns INTEGER NOT NULL, slot INTEGER NOT NULL, "
+        "continuity_epoch INTEGER, durable_output_sequence INTEGER, source_instance_id TEXT, "
         "PRIMARY KEY(source_frame_sha256, event_index))"
+    )
+    # Existing operational indexes remain readable.  A future scientific index
+    # is created with these columns from day one, while an interrupted upgrade
+    # gets a deterministic, idempotent schema migration.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+    if "continuity_epoch" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN continuity_epoch INTEGER")
+    if "durable_output_sequence" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN durable_output_sequence INTEGER")
+    if "source_instance_id" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN source_instance_id TEXT")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS source_order ("
+        "continuity_epoch INTEGER NOT NULL, durable_output_sequence INTEGER NOT NULL, "
+        "source_frame_sha256 TEXT NOT NULL, "
+        "PRIMARY KEY(continuity_epoch, durable_output_sequence))"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS source_order_v2 ("
+        "source_instance_id TEXT NOT NULL, continuity_epoch INTEGER NOT NULL, durable_output_sequence INTEGER NOT NULL, "
+        "source_frame_sha256 TEXT NOT NULL, "
+        "PRIMARY KEY(source_instance_id, continuity_epoch, durable_output_sequence))"
     )
     connection.execute(
         "CREATE TABLE IF NOT EXISTS window_events ("
@@ -143,9 +166,27 @@ def intrinsic_event(row: dict) -> dict:
     return {key: value for key, value in row.items() if key not in WINDOW_SCOPED_FIELDS}
 
 
+def scientific_order(row: dict, window_id: str, line_number: int) -> tuple[str, int, int, int, str]:
+    try:
+        epoch = int(row["continuity_epoch"])
+        sequence = int(row["durable_output_sequence"])
+        event_index = int(row["event_index"])
+        frame = str(row["source_frame_sha256"])
+        instance = str(row["source_instance_id"])
+        if epoch < 0 or sequence <= 0 or event_index < 0 or not frame or not instance:
+            raise ValueError("invalid source order")
+        return instance, epoch, sequence, event_index, frame
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"FAIL_CLOSED: invalid scientific source order {window_id}:{line_number}") from error
+
+
 def ingest(connection: sqlite3.Connection, receipt: dict, rows_path: Path,
-           receipt_sha256: str, rows_sha256: str) -> tuple[int, int]:
+           receipt_sha256: str, rows_sha256: str, *, require_scientific_order: bool) -> tuple[int, int]:
     window_id = receipt["window_id"]
+    if require_scientific_order:
+        validation = receipt.get("scientific_validation")
+        if not isinstance(validation, dict) or int(validation.get("rows", 0)) <= 0:
+            raise RuntimeError(f"FAIL_CLOSED: receipt lacks scientific eligibility proof {window_id}")
     source_refs = canonical(receipt["source_partition_refs"])
     decoder_sha256 = str(receipt["decoder"]["decoder_sha256"])
     existing = connection.execute(
@@ -169,10 +210,24 @@ def ingest(connection: sqlite3.Connection, receipt: dict, rows_path: Path,
             if not frame:
                 raise RuntimeError(f"FAIL_CLOSED: missing source frame identity {window_id}:{line_number}")
             event_index = int(row["event_index"])
+            instance = None
+            epoch = sequence = None
+            if require_scientific_order:
+                instance, epoch, sequence, ordered_event_index, ordered_frame = scientific_order(row, window_id, line_number)
+                if ordered_event_index != event_index or ordered_frame != frame:
+                    raise RuntimeError(f"FAIL_CLOSED: inconsistent event identity {window_id}:{line_number}")
+                known = connection.execute(
+                    "SELECT source_frame_sha256 FROM source_order_v2 WHERE source_instance_id = ? AND continuity_epoch = ? AND durable_output_sequence = ?",
+                    (instance, epoch, sequence),
+                ).fetchone()
+                if known and known[0] != frame:
+                    raise RuntimeError(f"FAIL_CLOSED: conflicting scientific source order {window_id}:{line_number}")
+                connection.execute("INSERT OR IGNORE INTO source_order_v2 VALUES (?, ?, ?, ?)",
+                                   (instance, epoch, sequence, frame))
             intrinsic = canonical(intrinsic_event(row))
             cursor = connection.execute(
-                "INSERT OR IGNORE INTO events VALUES (?, ?, ?, ?, ?)",
-                (frame, event_index, intrinsic, int(row["received_at_unix_ns"]), int(row["slot"])),
+                "INSERT OR IGNORE INTO events (source_frame_sha256,event_index,intrinsic_canonical,received_at_unix_ns,slot,continuity_epoch,durable_output_sequence,source_instance_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (frame, event_index, intrinsic, int(row["received_at_unix_ns"]), int(row["slot"]), epoch, sequence, instance if require_scientific_order else None),
             )
             if cursor.rowcount:
                 inserted += 1
@@ -219,13 +274,15 @@ def export_canonical(connection: sqlite3.Connection, index_root: Path) -> dict:
     events_path = export_root / "events.jsonl"
     exposures_path = export_root / "window-exposures.jsonl"
     for path, query in [
-        (events_path, "SELECT source_frame_sha256,event_index,intrinsic_canonical,received_at_unix_ns,slot FROM events ORDER BY received_at_unix_ns,slot,source_frame_sha256,event_index"),
+        (events_path, "SELECT source_frame_sha256,event_index,intrinsic_canonical,received_at_unix_ns,slot,continuity_epoch,durable_output_sequence,source_instance_id FROM events ORDER BY CASE WHEN source_instance_id IS NULL THEN 1 ELSE 0 END,source_instance_id,continuity_epoch,durable_output_sequence,event_index,source_frame_sha256"),
         (exposures_path, "SELECT window_id,source_frame_sha256,event_index,exposure_canonical FROM window_events ORDER BY window_id,source_frame_sha256,event_index"),
     ]:
         temporary = path.with_name(f".{path.name}.tmp")
         with temporary.open("w") as handle:
             for row in connection.execute(query):
-                handle.write(canonical(dict(zip(("source_frame_sha256", "event_index", "intrinsic_canonical", "received_at_unix_ns", "slot") if path == events_path else ("window_id", "source_frame_sha256", "event_index", "exposure_canonical"), row))) + "\n")
+                keys = (("source_frame_sha256", "event_index", "intrinsic_canonical", "received_at_unix_ns", "slot", "continuity_epoch", "durable_output_sequence", "source_instance_id")
+                        if path == events_path else ("window_id", "source_frame_sha256", "event_index", "exposure_canonical"))
+                handle.write(canonical(dict(zip(keys, row))) + "\n")
             handle.flush(); os.fsync(handle.fileno())
         os.replace(temporary, path)
     manifest = {
@@ -244,6 +301,7 @@ def main() -> None:
     parser.add_argument("--index-root", type=Path, required=True)
     parser.add_argument("--queue-root", type=Path)
     parser.add_argument("--export-canonical", action="store_true")
+    parser.add_argument("--require-scientific-order", action="store_true")
     args = parser.parse_args()
     queue_root = args.queue_root or args.materializer_out / "canonical-ingest"
     database = args.index_root / "market-events-v2.sqlite"
@@ -253,7 +311,8 @@ def main() -> None:
         for descriptor_path in claim_descriptors(queue_root):
             _, receipt, rows, receipt_hash, rows_hash = validate_descriptor(args.materializer_out, descriptor_path)
             with connection:
-                added, overlap = ingest(connection, receipt, rows, receipt_hash, rows_hash)
+                added, overlap = ingest(connection, receipt, rows, receipt_hash, rows_hash,
+                                        require_scientific_order=args.require_scientific_order)
             new += added; duplicates += overlap
             _, processing, processed = queue_paths(queue_root)
             processed.mkdir(parents=True, exist_ok=True)

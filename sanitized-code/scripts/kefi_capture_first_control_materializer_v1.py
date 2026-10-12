@@ -93,22 +93,52 @@ def decoder_identity(decoder: Path) -> dict[str, str]:
     return {"decoder_path": str(decoder), "decoder_sha256": sha256(decoder)}
 
 
-def validate_cohort_rows(rows_path: Path, registry_script: Path, registry_root: Path, boundary_utc: str) -> None:
-    """Reject any decoded row that is outside the registered future cohort."""
+def validate_scientific_rows(rows_path: Path, registry_script: Path, registry_root: Path,
+                             boundary_utc: str) -> dict[str, int]:
+    """Prove every row is ordered and eligible for a future scientific cohort.
+
+    A receipt timestamp is an availability clock, not a total order.  The
+    source-writer sequence is therefore mandatory here.  A duplicate sequence
+    in an epoch is permitted only for different events in *one* source frame;
+    any other collision is an evidence-order ambiguity and fails closed.
+    """
     spec = importlib.util.spec_from_file_location("kefi_epochs", registry_script)
     if not spec or not spec.loader:
         raise RuntimeError("FAIL_CLOSED: cannot load epoch registry")
     epochs = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(epochs)
+    frame_orders: dict[tuple[str, int, int], str] = {}
+    event_orders: set[tuple[str, int, int, int]] = set()
+    rows = 0
     for line_number, line in enumerate(rows_path.read_text().splitlines(), start=1):
         try:
-            received_ns = int(json.loads(line)["received_at_unix_ns"])
+            row = json.loads(line)
+            received_ns = int(row["received_at_unix_ns"])
+            epoch = int(row["continuity_epoch"])
+            sequence = int(row["durable_output_sequence"])
+            event_index = int(row["event_index"])
+            frame = str(row["source_frame_sha256"])
+            instance = str(row["source_instance_id"])
+            if epoch < 0 or sequence <= 0 or event_index < 0 or not frame or not instance:
+                raise ValueError("invalid deterministic source order")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"FAIL_CLOSED: invalid cohort row {line_number}") from error
+            raise RuntimeError(f"FAIL_CLOSED: invalid scientific row {line_number}") from error
+        source_key = (instance, epoch, sequence)
+        previous = frame_orders.setdefault(source_key, frame)
+        if previous != frame:
+            raise RuntimeError(f"FAIL_CLOSED: source-order collision at row {line_number}")
+        event_key = (instance, epoch, sequence, event_index)
+        if event_key in event_orders:
+            raise RuntimeError(f"FAIL_CLOSED: duplicate deterministic event order at row {line_number}")
+        event_orders.add(event_key)
         timestamp = dt.datetime.fromtimestamp(
             received_ns / 1_000_000_000, tz=dt.timezone.utc
         ).isoformat(timespec="microseconds").replace("+00:00", "Z")
         epochs.eligible(registry_root, timestamp, boundary_utc)
+        rows += 1
+    if not rows:
+        raise RuntimeError("FAIL_CLOSED: scientific materialization emitted zero rows")
+    return {"rows": rows, "source_frames": len(frame_orders), "ordered_events": len(event_orders)}
 
 
 def verified_processed_receipt(out: Path, window_id: str) -> bool:
@@ -340,11 +370,15 @@ def main() -> None:
     parser.add_argument("--registry-script", type=Path)
     parser.add_argument("--registry-root", type=Path)
     parser.add_argument("--boundary-utc")
+    parser.add_argument("--scientific", action="store_true",
+                        help="require registered epoch eligibility and durable source order")
     parser.add_argument("--list-eligible", action="store_true")
     args = parser.parse_args()
     cohort_args = (args.registry_script, args.registry_root, args.boundary_utc)
     if any(cohort_args) and not all(cohort_args):
         raise SystemExit("FAIL_CLOSED: registry-script, registry-root, and boundary-utc are required together")
+    if args.scientific and not all(cohort_args):
+        raise SystemExit("FAIL_CLOSED: scientific materialization requires registry-script, registry-root, and boundary-utc")
 
     if not args.rebuild_deduplicated_market and not args.decoder.is_file():
         raise SystemExit("FAIL_CLOSED: decoder missing")
@@ -397,8 +431,11 @@ def main() -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             summary = decode_window(args.decoder, window_id, window, destination, args.cache_root)
-            if args.registry_script:
-                validate_cohort_rows(destination, args.registry_script, args.registry_root, args.boundary_utc)
+            scientific_validation = None
+            if args.scientific:
+                scientific_validation = validate_scientific_rows(
+                    destination, args.registry_script, args.registry_root, args.boundary_utc
+                )
         except Exception:
             destination.unlink(missing_ok=True)
             destination.with_suffix(".summary.json").unlink(missing_ok=True)
@@ -413,6 +450,7 @@ def main() -> None:
             "source_partition_refs": source_partition_refs(window),
             "decoder": decoder_identity(args.decoder),
             "decoder_summary": summary,
+            "scientific_validation": scientific_validation,
             "outcome_blind": True,
             "pnl_accessed": False,
         }
