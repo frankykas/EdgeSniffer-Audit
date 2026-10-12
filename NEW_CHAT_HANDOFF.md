@@ -101,8 +101,8 @@ At present we are before step 1 for the final kEfi H3 attempt.
 - Watchdog: `edgesniffer-kefi-full-meta-capture-first-watchdog-v8.service`
 - Materializer: `edgesniffer-kefi-capture-first-control-v8.service/.timer`
 - Capacity guard: `edgesniffer-kefi-capacity-guard-v8.service/.timer`
-- At 2026-10-12T04:02Z: source + watchdog active, materializer timer/service
-  inactive by design, guard active, root ~112 GiB free, hot volume ~406 GiB
+- At 2026-10-12T04:32Z: source + watchdog active, materializer timer/service
+  inactive by design, guard active, root ~111 GiB free, hot volume ~403 GiB
   free. Fresh source health since 02:17Z restart: zero reconnects/errors/gaps,
   zero queue-full and promotion failures.
 
@@ -114,7 +114,10 @@ At present we are before step 1 for the final kEfi H3 attempt.
 - Added mountpoint and `/dev/vdc1` identity pre-start checks to source and
   materializer units.
 - Patched capacity guard so it stops materialization first and only claims an
-  emergency collector pause after unit state verification.
+  emergency collector pause after successful `systemctl stop`, a loaded unit,
+  inactive/dead state, and `MainPID=0`. It verifies the hot mount resolves to
+  `/dev/vdc1` on every guard cycle. The current deployed guard SHA-256 is
+  `9d4c9c0f4297a4099bf724cb41d00515a5c78a6ecaa80f235383d3f37a908e3d`.
 - Removed the service runner's automatic global `market-deduplicated.jsonl`
   rebuild after every bounded materializer cycle. A bounded live four-window
   cycle passed without triggering the rebuild.
@@ -127,18 +130,22 @@ This is the exact implementation order. Do not skip it because capture happens
 to look healthy:
 
 1. Create scientific epoch/quarantine registry and enforce it.
-2. Replace legacy JSONL/replay mechanics with incremental, content-verified
-   canonical event ingestion and compact Parquet/DuckDB research tables.
-3. Change restart behavior so previously processed windows are validated by
-   receipt/content hash, not a remembered ID alone.
-4. Bind raw source manifests/object hashes and decoder binary/source hash to
-   every promotion/materialization receipt.
-5. Add negative-path tests for capacity-stop verification and mount identity.
-6. Perform the pre-entry/actionability/paper-mechanics audit.
-7. Register at most 24 complete historical H3 candidate specifications,
+2. Replace legacy JSONL/replay mechanics with truly incremental,
+   content-verified canonical raw-event ingestion. Its current SQLite index is
+   a prototype only: unintegrated and still O(history) due to re-hashing old
+   rows on every invocation.
+3. Prove restart equivalence and bind frozen receipt hashes, source manifests,
+   decoder binary **and schema generation**. Keep intrinsic events separate
+   from window/teacher exposure mappings.
+4. Perform the pre-entry/actionability/paper-mechanics audit: availability
+   semantics, same-slot ordering, decision latency, AMM arithmetic, fees,
+   incomplete windows, controls, clustering, and clock assumptions.
+5. Build audited compact Parquet/DuckDB research tables and deterministic
+   control/split assignments.
+6. Register at most 24 complete historical H3 candidate specifications,
    evaluate with purged chronological folds and pool/time clustering, then
    freeze exactly one.
-8. Create one fresh H3 paper boundary and keep outcomes sealed until the
+7. Create one fresh H3 paper boundary and keep outcomes sealed until the
    pre-registered information requirement is reached.
 
 ## Communication Expectations
@@ -166,4 +173,3 @@ not give vague “all good” status. For every report say:
 - no raw copy per wallet/hypothesis;
 - no broad delete/archive without hashes, dependency proofs, and release receipt;
 - no restart of healthy capture for a test that can be mocked/offline.
-

@@ -5,6 +5,11 @@
 > records the initial package reconciliation and must not be read as a claim
 > that all audit blockers are closed.
 
+> The subsequent independent re-audit is incorporated in the implementation
+> ledger and handoff. In particular, the incremental index remains an
+> unintegrated O(history) prototype, and the capacity guard was hardened again
+> after the re-audit identified weak stop verification. H3 remains NO-GO.
+
 ## Verified Package Corrections
 
 The first public packet had packaging drift: the supplied tests expected scripts
