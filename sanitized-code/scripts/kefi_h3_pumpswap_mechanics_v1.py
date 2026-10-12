@@ -214,7 +214,8 @@ def control_context(row: dict, first_seen: dict[tuple[str, int, str], int]) -> t
 
 
 def deterministic_controls(targets: Iterable[dict], candidates: Iterable[dict], *, bucket_ns: int,
-                           per_target: int, seed: str) -> dict[tuple, list[dict]]:
+                           per_target: int, seed: str,
+                           first_seen: dict[tuple[str, int, str], int] | None = None) -> dict[tuple, list[dict]]:
     """Choose frozen-stratum, pre-entry-only controls reproducibly.
 
     ``bucket_ns`` is retained as an explicit compatibility/assertion argument;
@@ -232,7 +233,12 @@ def deterministic_controls(targets: Iterable[dict], candidates: Iterable[dict], 
         if existing != row:
             raise NonTradeable("CONFLICTING_DUPLICATE_CANDIDATE")
     ordered_candidates = sorted_unique(candidate_rows)
-    first_seen = observed_pool_first_seen(unique_rows.values())
+    # Qualification callers must provide the first-seen map from the complete
+    # ordered scientific stream.  The fallback exists only for compatibility
+    # with the standalone mechanics primitive; it is not sufficient cohort
+    # provenance because eligibility/warm-up filtering can hide earlier rows.
+    if first_seen is None:
+        first_seen = observed_pool_first_seen(unique_rows.values())
     indexed: dict[tuple, list[dict]] = defaultdict(list)
     for row in ordered_candidates:
         try:

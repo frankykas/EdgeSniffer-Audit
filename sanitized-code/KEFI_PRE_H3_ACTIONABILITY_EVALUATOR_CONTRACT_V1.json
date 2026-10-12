@@ -50,7 +50,7 @@
     "mechanics_script": "scripts/kefi_h3_pumpswap_mechanics_v1.py",
     "mechanics_sha256": "cec0bc53ea0a83a947320e6df789b4bb3b3aac5dc7b95600004f18f8eecffa6d",
     "assignment_builder_script": "scripts/kefi_pre_h3_assignment_builder_v1.py",
-    "assignment_builder_sha256": "1078d5ea5ef6679e33092ab69b9b305ba9f31e26add3753bb25b5ef31c3068b2",
+    "assignment_builder_sha256": "6533a8cb63e7cbd32b10bed67e233fb87139cc7b74ae9c18333846d5a5acbd14",
     "assignment_builder_contract": "requires frozen fingerprint + boundary receipt + scientific receipts + verified epoch registry; emits assignments but cannot evaluate them",
     "evaluator_script": "scripts/kefi_pre_h3_actionability_evaluator_v1.py",
     "evaluator_sha256": "b4c47e3b5d4de8cd6c583077cee5d40c2c2e77732fe21c0c20d1433765e30aa8"

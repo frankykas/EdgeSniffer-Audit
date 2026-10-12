@@ -21,6 +21,9 @@ conservative delay.  It does not claim that an actionable match is profitable.
 
 - Base fingerprint artifact SHA-256:
   `db08899d92f4d69d8c0234cfff9cbd05bd27dfb1365aed88d08b85f88cfc1b4a`.
+- Its exact feature-name/order schema is frozen and checked before assignment;
+  the verification receipt is
+  `KEFI_PRE_H3_FROZEN_INPUT_VERIFICATION.json`.
 - No refit, threshold adjustment, feature selection, overlay, or model-family
   comparison.
 - Fresh evidence begins only after this proposal is independently approved and
@@ -79,6 +82,11 @@ only if they match every frozen stratum below:
 - same fixed pre-event quote-liquidity log10 bucket of width `0.5`, computed
   from reconstructed `pre_state.pool_quote_raw` only;
 - different mint from the target.
+
+Observed pool age is derived from the **complete ordered scientific row
+stream** for the source instance/epoch, before warm-up, target, or non-match
+filtering. Earlier ineligible or warm-up rows therefore remain provenance for
+age matching even though they cannot become a target/control themselves.
 
 The control matcher reads no post-entry trajectory, later mark, PnL, return,
 or result field.  Its complete frozen input is the source order, availability
@@ -195,6 +203,12 @@ Any reconnect, continuity gap, late-earlier ordering violation, decoder
 rejection, watermark regression, missing scheduled tick, or source hard wall
 invalidates the active candidate cohort.  No interval is bridged.  All such
 events are reported rather than silently omitted.
+
+An active qualification requires exactly one source instance and continuity
+epoch. A source-instance or continuity-epoch break is a cohort-level hard wall:
+the builder fails closed and does not produce assignments from either side in a
+combined cohort. A later clean run requires a separate approved boundary; no
+cross-break aggregation is permitted.
 
 ## Explicit Non-Claims and Next Step
 

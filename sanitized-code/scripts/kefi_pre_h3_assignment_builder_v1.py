@@ -12,9 +12,8 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import math
 import os
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
@@ -26,6 +25,13 @@ ENTRY_DELAY_NS = 1_000_000_000
 HORIZON_NS = 120_000_000_000
 CHRONOLOGICAL_BLOCKS = 8
 MAX_CONTROLS = 4
+EXPECTED_FROZEN_SCORER_SHA256 = "ae1771faeda813547ab8a0294c1384402580c1f1028c5672a570b613c801cff4"
+FROZEN_FEATURE_NAMES = (
+    "log_pre_pool_quote", "log_pre_pool_base", "amm_fee_bps", "observed_pool_age_seconds",
+    "seconds_since_previous_observed_buy", "prior_pre_pool_quote_log_change", "prior_buy_count_5s",
+    "prior_buy_count_20s", "prior_buy_count_60s", "prior_buy_quote_5s", "prior_buy_quote_20s",
+    "prior_buy_quote_60s", "no_prior_observed_buy",
+)
 
 
 def sha256(path: Path) -> str:
@@ -71,60 +77,19 @@ def event_id(mechanics, row: dict) -> str:
     return "|".join(map(str, mechanics.event_key(row)))
 
 
-class PoolState:
-    """Frozen base-fingerprint features, observed strictly before each row."""
-    windows = (5, 20, 60)
-
-    def __init__(self) -> None:
-        self.events: deque[tuple[int, float]] = deque()
-        self.first: int | None = None
-        self.last: int | None = None
-        self.last_quote: float | None = None
-
-    def snapshot(self, timestamp_ns: int, row: dict) -> list[float]:
-        while self.events and self.events[0][0] < timestamp_ns - 60_000_000_000:
-            self.events.popleft()
-        quote = float(row.get("pool_quote_raw", 0) or 0) - float(row.get("pool_quote_delta", 0) or 0)
-        base = float(row.get("pool_base_raw", 0) or 0) + float(row.get("base_amount", 0) or 0)
-        age = (timestamp_ns - self.first) / 1e9 if self.first is not None else 0.0
-        gap = (timestamp_ns - self.last) / 1e9 if self.last is not None else 86_400.0
-        values = [
-            math.log1p(max(quote, 0.0)), math.log1p(max(base, 0.0)),
-            float(row.get("lp_fee_bps", 0) or 0) + float(row.get("protocol_fee_bps", 0) or 0)
-            + float(row.get("coin_creator_bps", 0) or 0),
-            math.log1p(min(age, 86_400.0)), math.log1p(min(gap, 86_400.0)),
-            0.0 if not self.last_quote or quote <= 0 else math.log1p(quote) - math.log1p(self.last_quote),
-        ]
-        for window in self.windows:
-            values.append(math.log1p(sum(1 for stamp, _ in self.events if stamp >= timestamp_ns - window * 1_000_000_000)))
-        for window in self.windows:
-            values.append(math.log1p(sum(amount for stamp, amount in self.events if stamp >= timestamp_ns - window * 1_000_000_000)))
-        values.append(1.0 if self.last is None else 0.0)
-        return values
-
-    def observe(self, timestamp_ns: int, row: dict) -> None:
-        if self.first is None:
-            self.first = timestamp_ns
-        self.events.append((timestamp_ns, float(row.get("user_quote_amount", 0) or 0)))
-        self.last = timestamp_ns
-        quote = float(row.get("pool_quote_raw", 0) or 0) - float(row.get("pool_quote_delta", 0) or 0)
-        if quote > 0:
-            self.last_quote = quote
-
-
-def score(features: list[float], model: dict) -> float:
+def validate_fingerprint_schema(model: dict) -> None:
     required = ("features", "coefficients", "intercept", "standardization_means", "standardization_scales", "threshold")
-    if any(field not in model for field in required):
+    if any(field not in model for field in required) or model.get("schema") != "KEFI_RICH_PREENTRY_FINGERPRINT_V2":
         raise RuntimeError("FAIL_CLOSED: frozen fingerprint missing scoring contract")
-    if not (len(features) == len(model["features"]) == len(model["standardization_means"]) == len(model["standardization_scales"])):
+    if tuple(model["features"]) != FROZEN_FEATURE_NAMES:
+        raise RuntimeError("FAIL_CLOSED: frozen fingerprint feature-name/order mismatch")
+    if set(model["coefficients"]) != set(FROZEN_FEATURE_NAMES):
+        raise RuntimeError("FAIL_CLOSED: frozen fingerprint coefficient schema mismatch")
+    if not (len(model["features"]) == len(model["standardization_means"]) == len(model["standardization_scales"]) == len(FROZEN_FEATURE_NAMES)):
         raise RuntimeError("FAIL_CLOSED: frozen fingerprint feature shape mismatch")
-    standardized = []
-    for value, mean, scale in zip(features, model["standardization_means"], model["standardization_scales"]):
+    for scale in model["standardization_scales"]:
         if float(scale) == 0:
             raise RuntimeError("FAIL_CLOSED: frozen fingerprint zero scale")
-        standardized.append((value - float(mean)) / float(scale))
-    linear = float(model["intercept"]) + sum(float(model["coefficients"][name]) * value for name, value in zip(model["features"], standardized))
-    return 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, linear))))
 
 
 def read_rows(paths: Iterable[Path], mechanics) -> list[dict]:
@@ -172,17 +137,24 @@ def actionability(rows: list[dict], target: dict, mechanics) -> dict:
     return {"complete_actionable": False, "outcome_reason": outcome, "entry": entry, "mark": mark}
 
 
-def fingerprint_candidates(rows: list[dict], model: dict, boundary_ns: int, mechanics) -> tuple[list[dict], list[dict]]:
-    states: dict[tuple[str, int, str], PoolState] = defaultdict(PoolState)
+def fingerprint_candidates(rows: list[dict], model: dict, boundary_ns: int, mechanics, frozen_scorer) -> tuple[list[dict], list[dict]]:
+    """Run the original frozen scorer's state machine, names, and score code.
+
+    State is scoped to a source instance/continuity epoch so no source break can
+    leak pre-break context into a future qualification observation.
+    """
+    validate_fingerprint_schema(model)
+    states: dict[tuple[str, int, str], object] = defaultdict(frozen_scorer.PoolState)
     matches, non_matches = [], []
     for row in rows:
         received, instance, epoch, *_ = mechanics.availability_key(row)
         state = states[(instance, epoch, str(row.get("pool", "")))]
-        features = state.snapshot(received, row)
+        features = list(state.snapshot(received, row))
         supported = mechanics.tradeable(row)["tradeable"] and str(row.get("side", "")).upper() == "BUY"
         eligible = supported and not bool(row.get("is_tracked_teacher")) and received >= boundary_ns + WARMUP_NS
         if eligible:
-            enriched = {**row, "frozen_fingerprint_score": score(features, model)}
+            enriched = {**row, "_frozen_feature_vector": features,
+                        "frozen_fingerprint_score": frozen_scorer.score(features, model)}
             (matches if enriched["frozen_fingerprint_score"] >= float(model["threshold"]) else non_matches).append(enriched)
         state.observe(received, row)
     return matches, non_matches
@@ -202,14 +174,24 @@ def chronological_block(index: int, total: int) -> str:
     return f"block-{(index * CHRONOLOGICAL_BLOCKS) // total + 1:02d}"
 
 
-def build_assignments(rows: list[dict], model: dict, boundary_ns: int, mechanics, *, control_seed: str) -> list[dict]:
+def assert_single_continuous_source(rows: list[dict], mechanics) -> tuple[str, int]:
+    epochs = {(str(row["source_instance_id"]), int(row["continuity_epoch"])) for row in rows}
+    if len(epochs) != 1:
+        raise RuntimeError("FAIL_CLOSED: qualification source-instance/continuity break")
+    return next(iter(epochs))
+
+
+def build_assignments(rows: list[dict], model: dict, boundary_ns: int, mechanics, frozen_scorer, *, control_seed: str) -> list[dict]:
     # Assignment identity must not depend on JSONL enumeration order after a
     # restart; canonical source order is the only permitted input order.
     rows = mechanics.sorted_unique(rows)
-    matches, non_matches = fingerprint_candidates(rows, model, boundary_ns, mechanics)
+    assert_single_continuous_source(rows, mechanics)
+    complete_first_seen = mechanics.observed_pool_first_seen(rows)
+    matches, non_matches = fingerprint_candidates(rows, model, boundary_ns, mechanics, frozen_scorer)
     targets = unique_targets(matches, mechanics)
     controls = mechanics.deterministic_controls(targets, non_matches, bucket_ns=mechanics.CONTROL_BUCKET_NS,
-                                                per_target=MAX_CONTROLS, seed=control_seed)
+                                                per_target=MAX_CONTROLS, seed=control_seed,
+                                                first_seen=complete_first_seen)
     assignments = []
     for index, target in enumerate(targets):
         target_outcome = actionability(rows, target, mechanics)
@@ -271,6 +253,7 @@ def main() -> None:
     parser.add_argument("--scientific-receipt", type=Path, action="append", required=True)
     parser.add_argument("--registry-script", type=Path, required=True)
     parser.add_argument("--registry-root", type=Path, required=True)
+    parser.add_argument("--frozen-scorer", type=Path, required=True)
     parser.add_argument("--mechanics", type=Path, required=True)
     parser.add_argument("--evaluator", type=Path, required=True)
     parser.add_argument("--out-assignments", type=Path, required=True)
@@ -283,15 +266,20 @@ def main() -> None:
     if boundary.get("status") not in {"ACTIVE", "FROZEN"} or not boundary.get("boundaryUtc"):
         raise SystemExit("FAIL_CLOSED: invalid scientific boundary receipt")
     mechanics = load_module(args.mechanics, "kefi_preh3_mechanics")
+    if sha256(args.frozen_scorer) != EXPECTED_FROZEN_SCORER_SHA256:
+        raise SystemExit("FAIL_CLOSED: frozen strict-preentry scorer hash mismatch")
+    frozen_scorer = load_module(args.frozen_scorer, "kefi_frozen_strict_preentry_scorer")
     receipts = [validate_receipt(path) for path in args.scientific_receipt]
     paths = [Path(item["market_rows_path"]) for item in receipts]
     model = json.loads(args.fingerprint.read_text())
     if model.get("status") != "FROZEN_FOR_PROSPECTIVE_OUTCOME_BLIND_SHADOW" or not model.get("strict_preentry"):
         raise SystemExit("FAIL_CLOSED: invalid frozen fingerprint artifact")
+    validate_fingerprint_schema(model)
     rows = read_rows(paths, mechanics)
     assert_epoch_eligibility(rows, args.registry_script, args.registry_root, str(boundary["boundaryUtc"]))
+    source_instance_id, continuity_epoch = assert_single_continuous_source(rows, mechanics)
     assignments = build_assignments(rows, model, parse_utc_ns(str(boundary["boundaryUtc"])), mechanics,
-                                    control_seed=args.control_seed)
+                                    frozen_scorer, control_seed=args.control_seed)
     if not assignments:
         raise SystemExit("FAIL_CLOSED: no pre-entry eligible fingerprint targets")
     args.out_assignments.parent.mkdir(parents=True, exist_ok=True)
@@ -307,11 +295,16 @@ def main() -> None:
         "boundary_receipt_sha256": sha256(args.boundary_receipt), "boundary_utc": boundary["boundaryUtc"],
         "fingerprint_path": str(args.fingerprint), "fingerprint_sha256": sha256(args.fingerprint),
         "scientific_receipts": receipts, "mechanics_path": str(args.mechanics), "mechanics_sha256": sha256(args.mechanics),
+        "frozen_scorer_path": str(args.frozen_scorer), "frozen_scorer_sha256": sha256(args.frozen_scorer),
+        "frozen_feature_names": list(FROZEN_FEATURE_NAMES),
         "epoch_registry_path": str(args.registry_root), "epoch_registry_script": str(args.registry_script),
         "epoch_registry_sha256": sha256(args.registry_script),
         "assignment_builder_path": str(Path(__file__)), "assignment_builder_sha256": sha256(Path(__file__)),
         "evaluator_path": str(args.evaluator), "evaluator_sha256": sha256(args.evaluator),
         "control_seed_sha256": hashlib.sha256(args.control_seed.encode()).hexdigest(),
+        "source_instance_id": source_instance_id, "continuity_epoch": continuity_epoch,
+        "source_continuity_policy": "exactly one source_instance_id/continuity_epoch; any break invalidates the cohort",
+        "pool_first_seen_policy": "complete ordered scientific row stream before eligibility/warm-up/filtering",
         "assignments_path": str(args.out_assignments), "assignments_sha256": sha256(args.out_assignments),
         "targets_all": len(assignments), "targets_with_controls": sum(bool(a["controls"]) for a in assignments),
         "chronological_blocks": sorted({a["chronological_block"] for a in assignments}),
