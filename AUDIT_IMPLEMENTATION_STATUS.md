@@ -1,6 +1,6 @@
 # kEfi Audit Remediation Status
 
-Last reconciled: 2026-10-12 00:02 EDT (2026-10-12T04:02Z) against the live VPS.
+Last reconciled: 2026-10-12 00:31 EDT (2026-10-12T04:31Z) against the live VPS.
 
 This is a status ledger, not a claim that the research is ready for live trading.
 `VERIFIED` means checked against the live host or an executable test. `IMPLEMENTED`
@@ -16,7 +16,7 @@ claim has been made and no H3 paper boundary may rely on it.
 | Hot-volume routing | VERIFIED | `/mnt/edgesniffer-kefi-hot` is `/dev/vdc1`; source and materializer units have explicit routing overrides. |
 | Mount identity fail-closed check | IMPLEMENTED | Service pre-start checks require the mountpoint and `/dev/vdc1`. A reboot/mount-loss simulation has not been run because it would interrupt capture. |
 | Materializer timer | INTENTIONALLY INACTIVE | It remains disabled while the full-history JSONL design is replaced. Capture continues; this prevents another escalating I/O scan from competing with ingest. |
-| Capacity guard | IMPLEMENTED, HEALTHY CHECKED | Guard checks root plus hot path, stops materialization first, and only reports `EMERGENCY_PAUSED_VERIFIED` after a unit-state check. Mocked stop-failure regression coverage is still OPEN. |
+| Capacity guard | VERIFIED HEALTHY; HARDENED | Guard checks root plus hot path plus the live `/dev/vdc1` mount identity. It stops materialization first and requires a successful stop plus loaded/inactive/dead/zero-PID state before claiming an emergency pause. Mocked negative-path tests now cover missing-unit failure. |
 | Root free capacity | WATCH | 112 GiB free at reconciliation. New source/promotion writes are routed off root; legacy root data still needs verified archive/release. |
 | Hot free capacity | VERIFIED ADEQUATE | 406 GiB free at reconciliation. |
 
@@ -57,18 +57,20 @@ Still open:
 
 ### 3. Capacity safety and mount identity
 
-**Status: IMPLEMENTED; NEGATIVE-PATH TEST OPEN.**
+**Status: IMPLEMENTED; GUARD NEGATIVE-PATH TESTED.**
 
 Implemented on the VPS:
 
 - `RequiresMountsFor` and device identity checks for the source/materializer;
 - source promotions and control output route to `/mnt/edgesniffer-kefi-hot`;
 - warning pressure stops materialization before capture;
-- emergency pause verifies the collector unit is inactive before claiming
-  success.
+- emergency pause verifies successful stop, loaded unit, inactive/dead state,
+  and zero PID before claiming success;
+- each guard cycle verifies that the live hot mount is still `/dev/vdc1`.
 
-Do not call this fully regression-proven until the negative paths are tested in
-an isolated/mocked harness.
+Mount-loss is deliberately not simulated against the live collector. The guard
+and stop-verification negative paths are isolated/mocked; runtime mount
+identity is verified every guard cycle.
 
 ### 4. Evidence catalog
 
@@ -80,31 +82,36 @@ be the final catalog for the incremental evidence layer.
 
 ### 5. Retire repeated full-history JSONL dedup
 
-**Status: EMERGENCY MITIGATION IMPLEMENTED; ARCHITECTURAL REPLACEMENT OPEN.**
+**Status: PROTOTYPE IMPLEMENTED; INTEGRATION AND PERFORMANCE PROPERTY OPEN.**
 
 The service runner no longer calls the global deduplicated-market rebuild after
 each bounded cycle. A live four-window bounded cycle completed without that
 rebuild. This removes the immediate repeated-scan hazard.
 
-It does **not** yet provide the required canonical indexed event store. The
-next implementation target is append-only, content-verified partition
-ingestion followed by compact Parquet/DuckDB research tables.
+An incremental SQLite event-index prototype now validates each new receipt and
+enforces canonical source-event identity. It is deliberately not yet wired to
+the runner. In its current prototype form it re-hashes historical receipt rows
+on each invocation, so it is still O(history) I/O. The required next step is
+append-only content-verified ingestion plus compact Parquet/DuckDB canonical
+tables, with periodic integrity scrubs separated from the hot append path.
 
 ### 6. Restart-safe content verification
 
-**Status: OPEN.**
+**Status: PARTIALLY IMPLEMENTED; INTEGRATION OPEN.**
 
-`state.json` currently remembers processed identifiers. It must instead verify
-the existing receipt and output content hash before reusing a processed window.
-Bare IDs are not sufficient scientific provenance.
+The materializer now verifies a remembered output against its current receipt
+and rows hash. It still needs integration with the canonical index, which will
+persist the original receipt hash, source-manifest references, decoder identity
+and schema. Bare IDs are not sufficient scientific provenance.
 
 ### 7. Source-manifest / decoder binding
 
-**Status: OPEN.**
+**Status: PARTIALLY IMPLEMENTED; DATASET VERSION ENFORCEMENT OPEN.**
 
-Promotion admission must bind immutable source manifest/object hashes, and each
-derived-window receipt must record decoder binary or source hash plus schema
-version. A `COMPLETE` status/signature alone is not enough.
+New materializer receipts bind partition-manifest/object hashes and decoder
+binary hash. The canonical dataset still needs an enforced decoder schema
+generation policy, intrinsic-event versus window-exposure separation, and an
+authenticated pre-decode input descriptor.
 
 ### 8. Temporal/actionability and paper-mechanics audit
 
@@ -145,11 +152,10 @@ variance-based sample requirement. It is not an arbitrary 24-hour test.
 ## Immediate Build Order
 
 1. Write the epoch/quarantine registry and strict pre-H3 boundary guard.
-2. Build verified incremental ingestion for sealed windows; do not re-enable
-   the old full-history rebuild loop.
-3. Bind source manifests, output hashes, and decoder identity to receipts;
-   make restart reuse verify them.
-4. Generate canonical compact event/research tables from already sealed data.
-5. Run the temporal/actionability and paper-mechanics audit.
-6. Only then register the fixed, maximum-24 H3 discovery tournament.
-
+2. Complete truly incremental raw-event ingestion, prove equivalence/restart
+   behavior, and keep integrity scrubs off the hot append path.
+3. Run temporal/actionability plus AMM/paper-mechanics audit before freezing
+   feature/control tables.
+4. Generate canonical compact Parquet research tables and deterministic split/
+   control assignments from the audited raw event layer.
+5. Only then register the fixed, maximum-24 H3 discovery tournament.
