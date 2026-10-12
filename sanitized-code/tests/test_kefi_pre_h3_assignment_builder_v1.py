@@ -170,18 +170,27 @@ def test_atomic_jsonl_output_has_stable_content_across_rerun(tmp_path):
         assert b.sha256(path) == b.sha256(path)
 
 
-def test_end_to_end_receipt_registry_restart_is_byte_identical(tmp_path, monkeypatch):
+def test_end_to_end_canonical_manifest_registry_restart_is_byte_identical(tmp_path, monkeypatch):
     rows_path = tmp_path / "canonical.jsonl"
     rows_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in canonical_rows()))
     fingerprint = tmp_path / "frozen-fingerprint.json"
     fingerprint.write_text(json.dumps(model(), sort_keys=True))
     boundary = tmp_path / "boundary.json"
     boundary.write_text(json.dumps({"status": "ACTIVE", "boundaryUtc": "1970-01-01T00:00:00.000000000Z"}))
-    receipt = tmp_path / "scientific-receipt.json"
-    receipt.write_text(json.dumps({
-        "scientific_validation": {"rows": len(canonical_rows())},
-        "market_rows_path": str(rows_path), "market_rows_sha256": b.sha256(rows_path),
-    }))
+    exposures = tmp_path / "window-exposures.jsonl"
+    exposures.write_text(json.dumps({"source_frame_sha256": "frame-1", "event_index": 0,
+                                     "window_id": "one"}, sort_keys=True) + "\n")
+    canonical_manifest = tmp_path / "canonical-input-manifest.json"
+    canonical_manifest.write_text(json.dumps({
+        "schema": "KEFI_INCREMENTAL_EVENT_INDEX_V2_QUALIFICATION_INPUT_V1",
+        "canonical_events_path": str(rows_path),
+        "canonical_events_sha256": b.sha256(rows_path),
+        "window_exposures_path": str(exposures),
+        "window_exposures_sha256": b.sha256(exposures),
+        "canonical_events": len(canonical_rows()),
+        "window_exposures": 1,
+        "input_policy": "canonical intrinsic events exactly once; window multiplicity is provenance only",
+    }, sort_keys=True))
     registry_root = tmp_path / "registry"
     registry = ROOT / "scripts" / "kefi_scientific_epoch_registry_v1.py"
     registry_module = importlib.util.spec_from_file_location("registry", registry); assert registry_module and registry_module.loader
@@ -193,9 +202,12 @@ def test_end_to_end_receipt_registry_restart_is_byte_identical(tmp_path, monkeyp
     b.EXPECTED_FINGERPRINT_SHA256 = b.sha256(fingerprint)
     try:
         argv = ["builder", "--fingerprint", str(fingerprint), "--boundary-receipt", str(boundary),
-                "--scientific-receipt", str(receipt), "--registry-script", str(registry), "--registry-root", str(registry_root),
-                "--mechanics", str(MECHANICS), "--frozen-scorer", str(FROZEN_SCORER), "--evaluator", str(ROOT / "scripts" / "kefi_pre_h3_actionability_evaluator_v1.py"),
-                "--out-assignments", str(assignments), "--out-manifest", str(manifest), "--control-seed", "test-seed"]
+                "--canonical-input", str(rows_path), "--canonical-manifest", str(canonical_manifest),
+                "--registry-script", str(registry), "--registry-root", str(registry_root),
+                "--mechanics", str(MECHANICS), "--frozen-scorer", str(FROZEN_SCORER),
+                "--evaluator", str(ROOT / "scripts" / "kefi_pre_h3_actionability_evaluator_v1.py"),
+                "--out-assignments", str(assignments), "--out-manifest", str(manifest),
+                "--control-seed", "test-seed"]
         monkeypatch.setattr(sys, "argv", argv); b.main(); first = b.sha256(assignments)
         monkeypatch.setattr(sys, "argv", argv); b.main(); second = b.sha256(assignments)
     finally:

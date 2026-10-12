@@ -80,6 +80,29 @@ def test_queue_ingest_preserves_intrinsic_identity_and_exposures(tmp_path):
     assert len(list((out / "canonical-ingest" / "processed").glob("*.json"))) == 2
 
 
+def test_qualification_export_is_intrinsic_once_and_excludes_outcome_annotations(tmp_path):
+    out, index = tmp_path / "out", tmp_path / "index"
+    first = row("frame", 0, 100, "teacher-a")
+    first.update({"post_entry_pnl": 99, "future_outcome_label": True,
+                  "hypothetical_exit": "later"})
+    second = dict(first)
+    second["candidate_signature"] = "same-event-other-window"
+    write_window(out, "a", [first])
+    write_window(out, "b", [second])
+    result = run(out, index, "--export-qualification-input")
+    assert result.returncode == 0, result.stderr
+    root = index / "qualification-input-v1"
+    manifest = json.loads((root / "manifest.json").read_text())
+    events = [json.loads(line) for line in (root / "canonical-events.jsonl").read_text().splitlines()]
+    exposures = [json.loads(line) for line in (root / "window-exposures.jsonl").read_text().splitlines()]
+    assert manifest["canonical_events"] == 1
+    assert manifest["window_exposures"] == 2
+    assert len(events) == 1 and len(exposures) == 2
+    assert "post_entry_pnl" not in events[0]
+    assert "future_outcome_label" not in events[0]
+    assert "hypothetical_exit" not in events[0]
+
+
 def test_normal_run_does_not_require_old_receipts_or_scan_history(tmp_path):
     out, index = tmp_path / "out", tmp_path / "index"
     first = write_window(out, "a", [row("frame-a", 0, 100, "teacher-a")])

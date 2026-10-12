@@ -41,6 +41,10 @@ def record_path(registry: Path, epoch_id: str) -> Path:
     return registry / "records" / f"{epoch_id}.json"
 
 
+def closure_path(registry: Path, epoch_id: str) -> Path:
+    return registry / "closures" / f"{epoch_id}.json"
+
+
 def acquire_lock(registry: Path, timeout_seconds: float = 10.0) -> int:
     lock = registry / ".append.lock"
     deadline = time.monotonic() + timeout_seconds
@@ -90,6 +94,65 @@ def append(registry: Path, payload: dict) -> dict:
         release_lock(registry, descriptor)
 
 
+def closures(registry: Path) -> dict[str, dict]:
+    path = registry / "closures.jsonl"
+    result: dict[str, dict] = {}
+    previous = ""
+    for closure in load_lines(path):
+        claimed = closure.pop("closure_sha256", "")
+        if not claimed or closure.get("previous_closure_sha256") != previous or digest(closure) != claimed:
+            raise RuntimeError("FAIL_CLOSED: epoch closure hash chain mismatch")
+        target = str(closure.get("epoch_id", ""))
+        if not target or target in result:
+            raise RuntimeError("FAIL_CLOSED: invalid or duplicate epoch closure")
+        disk = closure_path(registry, target)
+        disk_payload = json.loads(disk.read_text()) if disk.is_file() else {}
+        disk_claimed = disk_payload.pop("closure_sha256", "")
+        if disk_claimed != claimed or digest(disk_payload) != claimed:
+            raise RuntimeError("FAIL_CLOSED: epoch closure publication mismatch")
+        result[target] = {**closure, "closure_sha256": claimed}
+        previous = claimed
+    return result
+
+
+def void_epoch(registry: Path, epoch_id: str, closed_at_utc: str, reason: str) -> dict:
+    registry.mkdir(parents=True, exist_ok=True)
+    descriptor = acquire_lock(registry)
+    try:
+        verify(registry); recover(registry); verify(registry)
+        rows = load_lines(registry / "epochs.jsonl")
+        target = next((row for row in rows if row["epoch_id"] == epoch_id), None)
+        if target is None:
+            raise RuntimeError("FAIL_CLOSED: cannot close unknown epoch")
+        existing = closures(registry)
+        if epoch_id in existing:
+            raise RuntimeError("FAIL_CLOSED: epoch already closed")
+        closed = parse_utc(closed_at_utc)
+        if closed < parse_utc(target["start_utc"]):
+            raise RuntimeError("FAIL_CLOSED: closure precedes epoch start")
+        previous = ""
+        prior = load_lines(registry / "closures.jsonl")
+        if prior:
+            previous = prior[-1]["closure_sha256"]
+        record = {"schema": SCHEMA + "_CLOSURE_V1", "epoch_id": epoch_id,
+                  "target_record_sha256": target["record_sha256"], "closed_at_utc": closed_at_utc,
+                  "reason": reason, "previous_closure_sha256": previous}
+        record["closure_sha256"] = digest(record)
+        path = closure_path(registry, epoch_id); path.parent.mkdir(parents=True, exist_ok=True)
+        pending = registry / "pending-closures" / f"{epoch_id}.json"; pending.parent.mkdir(parents=True, exist_ok=True)
+        with pending.open("wb") as handle:
+            handle.write(canonical(record)); handle.flush(); os.fsync(handle.fileno())
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(canonical(record)); handle.flush(); os.fsync(handle.fileno())
+        with (registry / "closures.jsonl").open("ab") as handle:
+            handle.write(canonical(record)); handle.flush(); os.fsync(handle.fileno())
+        pending.unlink(missing_ok=True)
+        return record
+    finally:
+        release_lock(registry, descriptor)
+
+
 def verify(registry: Path) -> None:
     previous = ""
     for record in load_lines(registry / "epochs.jsonl"):
@@ -103,6 +166,13 @@ def verify(registry: Path) -> None:
         if disk_claimed != claimed or digest(disk_payload) != claimed:
             raise RuntimeError("FAIL_CLOSED: epoch registry record publication mismatch")
         previous = claimed
+    known = {row["epoch_id"]: row for row in load_lines(registry / "epochs.jsonl")}
+    for epoch_id, closure in closures(registry).items():
+        target = known.get(epoch_id)
+        if target is None or closure.get("target_record_sha256") != target.get("record_sha256"):
+            raise RuntimeError("FAIL_CLOSED: closure target mismatch")
+        if parse_utc(closure["closed_at_utc"]) < parse_utc(target["start_utc"]):
+            raise RuntimeError("FAIL_CLOSED: closure precedes epoch start")
 
 
 def recover(registry: Path) -> None:
@@ -121,6 +191,20 @@ def recover(registry: Path) -> None:
         with journal.open("ab") as handle:
             handle.write(canonical({**record, "record_sha256": claimed})); handle.flush(); os.fsync(handle.fileno())
         previous = claimed
+    closure_journal = registry / "closures.jsonl"
+    closure_rows = load_lines(closure_journal)
+    known_closures = {row["epoch_id"] for row in closure_rows}
+    closure_previous = closure_rows[-1]["closure_sha256"] if closure_rows else ""
+    for path in sorted((registry / "closures").glob("*.json")) if (registry / "closures").exists() else []:
+        closure = json.loads(path.read_text())
+        if closure["epoch_id"] in known_closures:
+            continue
+        claimed = closure.pop("closure_sha256")
+        if closure.get("previous_closure_sha256") != closure_previous or digest(closure) != claimed:
+            raise RuntimeError("FAIL_CLOSED: unreconciled epoch closure")
+        with closure_journal.open("ab") as handle:
+            handle.write(canonical({**closure, "closure_sha256": claimed})); handle.flush(); os.fsync(handle.fileno())
+        closure_previous = claimed
 
 
 def eligible(registry: Path, at_utc: str, boundary_utc: str) -> None:
@@ -130,12 +214,22 @@ def eligible(registry: Path, at_utc: str, boundary_utc: str) -> None:
     if at < boundary:
         raise RuntimeError("INELIGIBLE_PRE_BOUNDARY")
     matching = []
+    voided_match = False
+    closed = closures(registry)
     for record in load_lines(registry / "epochs.jsonl"):
         validate_payload(record)
+        # A closure is a cohort void, not a permissive end timestamp.  Its
+        # historical contents remain auditable but are never eligible again.
+        if record["epoch_id"] in closed:
+            if parse_utc(record["start_utc"]) <= at:
+                voided_match = True
+            continue
         start = parse_utc(record["start_utc"])
         end = parse_utc(record.get("end_utc") or "9999-12-31T23:59:59Z")
         if start <= at <= end:
             matching.append(record)
+    if voided_match:
+        raise RuntimeError("INELIGIBLE_EPOCH_VOIDED")
     if not matching:
         raise RuntimeError("INELIGIBLE_EPOCH_GAP")
     if len(matching) != 1:
@@ -174,9 +268,15 @@ def main() -> None:
     parser.add_argument("--start-utc")
     parser.add_argument("--end-utc")
     parser.add_argument("--reason", default="")
+    parser.add_argument("--void-epoch")
+    parser.add_argument("--closed-at-utc")
     args = parser.parse_args()
     if args.verify:
         verify(args.registry); print("VERIFIED"); return
+    if args.void_epoch or args.closed_at_utc:
+        if not (args.void_epoch and args.closed_at_utc and args.reason):
+            raise SystemExit("void-epoch, closed-at-utc, and reason are required together")
+        print(json.dumps(void_epoch(args.registry, args.void_epoch, args.closed_at_utc, args.reason), sort_keys=True)); return
     if args.eligible_at_utc or args.boundary_utc:
         if not (args.eligible_at_utc and args.boundary_utc):
             raise SystemExit("eligible-at-utc and boundary-utc are required together")

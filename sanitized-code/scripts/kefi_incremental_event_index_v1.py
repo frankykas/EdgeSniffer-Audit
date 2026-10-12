@@ -23,6 +23,12 @@ WINDOW_SCOPED_FIELDS = {
     "candidate_signature", "candidate_signatures", "candidate_index",
     "window_id", "windowId", "window_path", "windowPath",
 }
+# These are derived/outcome annotations, never source evidence.  They cannot
+# affect canonical identity, frozen fingerprint membership, or control choice.
+OUTCOME_DERIVED_FIELDS = {
+    "post_entry_pnl", "future_outcome_label", "later_mark", "hypothetical_exit",
+    "actionability", "target_complete_actionable", "target_outcome_reason",
+}
 
 
 def canonical(value: object) -> str:
@@ -163,7 +169,8 @@ def validate_descriptor(out: Path, descriptor_path: Path) -> tuple[dict, dict, P
 
 
 def intrinsic_event(row: dict) -> dict:
-    return {key: value for key, value in row.items() if key not in WINDOW_SCOPED_FIELDS}
+    return {key: value for key, value in row.items()
+            if key not in WINDOW_SCOPED_FIELDS and key not in OUTCOME_DERIVED_FIELDS}
 
 
 def scientific_order(row: dict, window_id: str, line_number: int) -> tuple[str, int, int, int, str]:
@@ -295,12 +302,76 @@ def export_canonical(connection: sqlite3.Connection, index_root: Path) -> dict:
     return manifest
 
 
+def export_qualification_input(connection: sqlite3.Connection, index_root: Path) -> dict:
+    """Publish the sole permitted multi-window qualification input surface.
+
+    ``events`` is the intrinsic-event authority: one event per frame/index.
+    ``window_events`` is deliberately exported separately as multiplicity
+    provenance.  A downstream scientific builder must never concatenate
+    window JSONL files and decide for itself which duplicate is legitimate.
+    """
+    root = index_root / "qualification-input-v1"
+    root.mkdir(parents=True, exist_ok=True)
+    events_path, provenance_path = root / "canonical-events.jsonl", root / "window-exposures.jsonl"
+    temporary = events_path.with_name(f".{events_path.name}.tmp")
+    event_count = 0
+    with temporary.open("w") as handle:
+        query = (
+            "SELECT source_frame_sha256,event_index,intrinsic_canonical,received_at_unix_ns,slot,"
+            "continuity_epoch,durable_output_sequence,source_instance_id FROM events "
+            "ORDER BY source_instance_id,continuity_epoch,durable_output_sequence,event_index,source_frame_sha256"
+        )
+        for frame, event_index, intrinsic, received, slot, epoch, sequence, instance in connection.execute(query):
+            row = json.loads(intrinsic)
+            # The intrinsic payload remains the scientific row, but exported
+            # index columns must agree with it exactly rather than silently
+            # winning a conflict.
+            expected = {"source_frame_sha256": frame, "event_index": event_index,
+                        "received_at_unix_ns": received, "slot": slot,
+                        "continuity_epoch": epoch, "durable_output_sequence": sequence,
+                        "source_instance_id": instance}
+            if any(row.get(key) != value for key, value in expected.items()):
+                raise RuntimeError("FAIL_CLOSED: intrinsic/index provenance mismatch")
+            handle.write(canonical(row) + "\n"); event_count += 1
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(temporary, events_path)
+    temporary = provenance_path.with_name(f".{provenance_path.name}.tmp")
+    exposure_count = 0
+    with temporary.open("w") as handle:
+        query = (
+            "SELECT w.source_frame_sha256,w.event_index,w.window_id,w.exposure_canonical,"
+            "i.receipt_sha256,i.rows_sha256,i.decoder_sha256,i.source_refs_canonical "
+            "FROM window_events w JOIN ingested_windows i ON i.window_id=w.window_id "
+            "ORDER BY w.source_frame_sha256,w.event_index,w.window_id"
+        )
+        for frame, event_index, window_id, exposure, receipt_hash, rows_hash, decoder_hash, refs in connection.execute(query):
+            handle.write(canonical({"source_frame_sha256": frame, "event_index": event_index,
+                                    "window_id": window_id, "exposure": json.loads(exposure),
+                                    "receipt_sha256": receipt_hash, "market_rows_sha256": rows_hash,
+                                    "decoder_sha256": decoder_hash, "source_partition_refs": json.loads(refs)}) + "\n")
+            exposure_count += 1
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(temporary, provenance_path)
+    manifest = {
+        "schema": SCHEMA + "_QUALIFICATION_INPUT_V1",
+        "canonical_events_path": str(events_path), "canonical_events_sha256": sha256(events_path),
+        "window_exposures_path": str(provenance_path), "window_exposures_sha256": sha256(provenance_path),
+        "canonical_events": event_count, "window_exposures": exposure_count,
+        "index_database_sha256": sha256(index_root / "market-events-v2.sqlite"),
+        "input_policy": "canonical intrinsic events exactly once; window multiplicity is provenance only",
+        "outcome_blind": True, "pnl_accessed": False,
+    }
+    atomic_json(root / "manifest.json", manifest)
+    return manifest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--materializer-out", type=Path, required=True)
     parser.add_argument("--index-root", type=Path, required=True)
     parser.add_argument("--queue-root", type=Path)
     parser.add_argument("--export-canonical", action="store_true")
+    parser.add_argument("--export-qualification-input", action="store_true")
     parser.add_argument("--require-scientific-order", action="store_true")
     args = parser.parse_args()
     queue_root = args.queue_root or args.materializer_out / "canonical-ingest"
@@ -320,10 +391,11 @@ def main() -> None:
             fsync_directory(processing); fsync_directory(processed)
         events, _ = checkpoint(connection, database, args.index_root, new, duplicates)
         exported = export_canonical(connection, args.index_root) if args.export_canonical else None
+        qualification_export = export_qualification_input(connection, args.index_root) if args.export_qualification_input else None
     finally:
         connection.close()
     print(json.dumps({"canonical_events": events, "new_events": new, "verified_identical_overlaps": duplicates,
-                      "canonical_export": exported}, sort_keys=True))
+                      "canonical_export": exported, "qualification_input": qualification_export}, sort_keys=True))
 
 
 if __name__ == "__main__":

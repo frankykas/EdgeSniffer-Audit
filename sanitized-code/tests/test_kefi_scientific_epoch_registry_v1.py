@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 REGISTRY = Path(__file__).parents[1] / "scripts" / "kefi_scientific_epoch_registry_v1.py"
 
@@ -110,3 +112,16 @@ def test_invalid_kind_status_combination_fails_closed(tmp_path):
         assert "kind/status" in str(error)
     else:
         raise AssertionError("invalid kind/status accepted")
+
+
+def test_voided_future_epoch_is_wholly_ineligible_and_closure_is_verified(tmp_path):
+    epochs = module()
+    epochs.append(tmp_path, {"epoch_id": "void-me", "kind": "FUTURE_UNOPENED", "status": "UNOPENED",
+                             "start_utc": "2026-10-10T00:00:00Z", "end_utc": "", "reason": "test"})
+    closure = epochs.void_epoch(tmp_path, "void-me", "2026-10-10T01:00:00Z", "input-integrity-failure")
+    assert closure["epoch_id"] == "void-me"
+    epochs.verify(tmp_path)
+    with pytest.raises(RuntimeError, match="VOID"):
+        epochs.eligible(tmp_path, "2026-10-10T00:30:00Z", "2026-10-10T00:00:00Z")
+    with pytest.raises(RuntimeError, match="VOID"):
+        epochs.eligible(tmp_path, "2026-10-10T01:30:00Z", "2026-10-10T00:00:00Z")

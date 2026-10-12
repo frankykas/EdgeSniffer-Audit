@@ -9,6 +9,7 @@ identity; and writes the JSONL consumed by the frozen evaluator.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import importlib.util
 import json
@@ -137,6 +138,55 @@ def actionability(rows: list[dict], target: dict, mechanics) -> dict:
     return {"complete_actionable": False, "outcome_reason": outcome, "entry": entry, "mark": mark}
 
 
+class ActionabilityIndex:
+    """Exact indexed form of the frozen delayed-entry/mark scan.
+
+    The baseline mechanics scans every row for each target.  This index uses
+    the same canonical row order and the same *first* row at/after each
+    deadline, but scopes lookup to the already-required source/epoch/pool/mint
+    stream.  It changes cost, never selection or semantics.
+    """
+    def __init__(self, rows: list[dict], mechanics):
+        self.mechanics = mechanics
+        self.streams: dict[tuple[str, int, str, str], tuple[list[int], list[dict]]] = {}
+        grouped: dict[tuple[str, int, str, str], list[dict]] = defaultdict(list)
+        for row in mechanics.sorted_unique(rows):
+            _, instance, epoch, *_ = mechanics.availability_key(row)
+            grouped[(instance, epoch, str(row["pool"]), str(row["mint"]))].append(row)
+        for key, stream in grouped.items():
+            self.streams[key] = ([int(row["received_at_unix_ns"]) for row in stream], stream)
+
+    def first_at_or_after(self, row: dict, deadline_ns: int) -> dict | None:
+        _, instance, epoch, *_ = self.mechanics.availability_key(row)
+        values = self.streams.get((instance, epoch, str(row["pool"]), str(row["mint"])))
+        if values is None:
+            return None
+        stamps, stream = values
+        index = bisect.bisect_left(stamps, deadline_ns)
+        return stream[index] if index < len(stream) else None
+
+    def actionability(self, target: dict) -> dict:
+        entry_candidate = self.first_at_or_after(target, int(target["received_at_unix_ns"]) + ENTRY_DELAY_NS)
+        if entry_candidate is None:
+            return {"complete_actionable": False, "outcome_reason": "NO_POST_DELAY_ENTRY_STATE", "entry": {"status": "NON_TRADEABLE", "reason": "NO_SUPPORTED_POST_DELAY_ENTRY_STATE"}, "mark": None}
+        entry_state = self.mechanics.tradeable(entry_candidate)
+        if not entry_state["tradeable"]:
+            return {"complete_actionable": False, "outcome_reason": f"POST_DELAY_NON_TRADEABLE_{entry_state['reason']}", "entry": {"status": "NON_TRADEABLE", "reason": entry_state["reason"]}, "mark": None}
+        entry = {"status": "TRADEABLE", "entry_available_at_unix_ns": int(entry_candidate["received_at_unix_ns"]),
+                 "entry_event_key": entry_state["event_key"], "pre_state": entry_state["pre_state"]}
+        mark_candidate = self.first_at_or_after(entry_candidate, int(entry_candidate["received_at_unix_ns"]) + HORIZON_NS)
+        if mark_candidate is None:
+            return {"complete_actionable": False, "outcome_reason": "NO_120S_MARK", "entry": entry,
+                    "mark": {"status": "NON_TRADEABLE", "reason": "NO_SUPPORTED_EXIT_MARK"}}
+        mark_state = self.mechanics.tradeable(mark_candidate)
+        if not mark_state["tradeable"]:
+            return {"complete_actionable": False, "outcome_reason": f"POST_ENTRY_NON_TRADEABLE_{mark_state['reason']}", "entry": entry,
+                    "mark": {"status": "NON_TRADEABLE", "reason": mark_state["reason"]}}
+        return {"complete_actionable": True, "outcome_reason": "COMPLETE_ACTIONABLE_TRAJECTORY", "entry": entry,
+                "mark": {"status": "MARK_AVAILABLE", "mark_available_at_unix_ns": int(mark_candidate["received_at_unix_ns"]),
+                         "mark_event_key": mark_state["event_key"], "pre_state": mark_state["pre_state"]}}
+
+
 def fingerprint_candidates(rows: list[dict], model: dict, boundary_ns: int, mechanics, frozen_scorer) -> tuple[list[dict], list[dict]]:
     """Run the original frozen scorer's state machine, names, and score code.
 
@@ -187,6 +237,7 @@ def build_assignments(rows: list[dict], model: dict, boundary_ns: int, mechanics
     rows = mechanics.sorted_unique(rows)
     assert_single_continuous_source(rows, mechanics)
     complete_first_seen = mechanics.observed_pool_first_seen(rows)
+    actionability_index = ActionabilityIndex(rows, mechanics)
     matches, non_matches = fingerprint_candidates(rows, model, boundary_ns, mechanics, frozen_scorer)
     targets = unique_targets(matches, mechanics)
     controls = mechanics.deterministic_controls(targets, non_matches, bucket_ns=mechanics.CONTROL_BUCKET_NS,
@@ -194,10 +245,10 @@ def build_assignments(rows: list[dict], model: dict, boundary_ns: int, mechanics
                                                 first_seen=complete_first_seen)
     assignments = []
     for index, target in enumerate(targets):
-        target_outcome = actionability(rows, target, mechanics)
+        target_outcome = actionability_index.actionability(target)
         selected_controls = []
         for control in controls.get(mechanics.event_key(target), []):
-            control_outcome = actionability(rows, control, mechanics)
+            control_outcome = actionability_index.actionability(control)
             selected_controls.append({
                 "control_id": event_id(mechanics, control),
                 "complete_actionable": control_outcome["complete_actionable"],
@@ -220,16 +271,26 @@ def build_assignments(rows: list[dict], model: dict, boundary_ns: int, mechanics
     return assignments
 
 
-def validate_receipt(receipt_path: Path) -> dict:
-    receipt = json.loads(receipt_path.read_text())
-    validation = receipt.get("scientific_validation")
-    if not isinstance(validation, dict) or int(validation.get("rows", 0)) <= 0:
-        raise RuntimeError(f"FAIL_CLOSED: unverified scientific receipt {receipt_path}")
-    rows = Path(str(receipt.get("market_rows_path", "")))
-    if not rows.is_file() or sha256(rows) != str(receipt.get("market_rows_sha256", "")):
-        raise RuntimeError(f"FAIL_CLOSED: receipt row binding mismatch {receipt_path}")
-    return {"receipt_path": str(receipt_path), "receipt_sha256": sha256(receipt_path),
-            "market_rows_path": str(rows), "market_rows_sha256": sha256(rows)}
+def validate_canonical_input(manifest_path: Path, rows_path: Path) -> dict:
+    """Require the canonical index export; receipt concatenation is forbidden."""
+    manifest = json.loads(manifest_path.read_text())
+    expected_schema = "KEFI_INCREMENTAL_EVENT_INDEX_V2_QUALIFICATION_INPUT_V1"
+    if manifest.get("schema") != expected_schema:
+        raise RuntimeError("FAIL_CLOSED: invalid canonical qualification manifest")
+    if Path(str(manifest.get("canonical_events_path", ""))).resolve() != rows_path.resolve():
+        raise RuntimeError("FAIL_CLOSED: canonical input path not bound by manifest")
+    if not rows_path.is_file() or sha256(rows_path) != str(manifest.get("canonical_events_sha256", "")):
+        raise RuntimeError("FAIL_CLOSED: canonical input hash mismatch")
+    provenance = Path(str(manifest.get("window_exposures_path", "")))
+    if not provenance.is_file() or sha256(provenance) != str(manifest.get("window_exposures_sha256", "")):
+        raise RuntimeError("FAIL_CLOSED: canonical exposure provenance hash mismatch")
+    if manifest.get("input_policy") != "canonical intrinsic events exactly once; window multiplicity is provenance only":
+        raise RuntimeError("FAIL_CLOSED: canonical input policy mismatch")
+    return {"manifest_path": str(manifest_path), "manifest_sha256": sha256(manifest_path),
+            "canonical_events_path": str(rows_path), "canonical_events_sha256": sha256(rows_path),
+            "window_exposures_path": str(provenance), "window_exposures_sha256": sha256(provenance),
+            "canonical_events": int(manifest.get("canonical_events", -1)),
+            "window_exposures": int(manifest.get("window_exposures", -1))}
 
 
 def utc_from_ns(value: int) -> str:
@@ -250,7 +311,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fingerprint", type=Path, required=True)
     parser.add_argument("--boundary-receipt", type=Path, required=True)
-    parser.add_argument("--scientific-receipt", type=Path, action="append", required=True)
+    parser.add_argument("--canonical-input", type=Path, required=True)
+    parser.add_argument("--canonical-manifest", type=Path, required=True)
     parser.add_argument("--registry-script", type=Path, required=True)
     parser.add_argument("--registry-root", type=Path, required=True)
     parser.add_argument("--frozen-scorer", type=Path, required=True)
@@ -269,13 +331,12 @@ def main() -> None:
     if sha256(args.frozen_scorer) != EXPECTED_FROZEN_SCORER_SHA256:
         raise SystemExit("FAIL_CLOSED: frozen strict-preentry scorer hash mismatch")
     frozen_scorer = load_module(args.frozen_scorer, "kefi_frozen_strict_preentry_scorer")
-    receipts = [validate_receipt(path) for path in args.scientific_receipt]
-    paths = [Path(item["market_rows_path"]) for item in receipts]
+    canonical_input = validate_canonical_input(args.canonical_manifest, args.canonical_input)
     model = json.loads(args.fingerprint.read_text())
     if model.get("status") != "FROZEN_FOR_PROSPECTIVE_OUTCOME_BLIND_SHADOW" or not model.get("strict_preentry"):
         raise SystemExit("FAIL_CLOSED: invalid frozen fingerprint artifact")
     validate_fingerprint_schema(model)
-    rows = read_rows(paths, mechanics)
+    rows = read_rows([args.canonical_input], mechanics)
     assert_epoch_eligibility(rows, args.registry_script, args.registry_root, str(boundary["boundaryUtc"]))
     source_instance_id, continuity_epoch = assert_single_continuous_source(rows, mechanics)
     assignments = build_assignments(rows, model, parse_utc_ns(str(boundary["boundaryUtc"])), mechanics,
@@ -294,7 +355,7 @@ def main() -> None:
         "pnl_accessed": False, "boundary_receipt_path": str(args.boundary_receipt),
         "boundary_receipt_sha256": sha256(args.boundary_receipt), "boundary_utc": boundary["boundaryUtc"],
         "fingerprint_path": str(args.fingerprint), "fingerprint_sha256": sha256(args.fingerprint),
-        "scientific_receipts": receipts, "mechanics_path": str(args.mechanics), "mechanics_sha256": sha256(args.mechanics),
+        "canonical_input": canonical_input, "mechanics_path": str(args.mechanics), "mechanics_sha256": sha256(args.mechanics),
         "frozen_scorer_path": str(args.frozen_scorer), "frozen_scorer_sha256": sha256(args.frozen_scorer),
         "frozen_feature_names": list(FROZEN_FEATURE_NAMES),
         "epoch_registry_path": str(args.registry_root), "epoch_registry_script": str(args.registry_script),

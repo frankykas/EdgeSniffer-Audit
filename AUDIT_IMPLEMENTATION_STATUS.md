@@ -1,11 +1,28 @@
 # kEfi Audit Remediation Status
 
-Last reconciled: 2026-10-12 11:30 EDT (2026-10-12T15:30Z) against the live VPS and public regression suite.
+Last reconciled: 2026-10-12 after the void-cohort canonical-input remediation and replay proof.
 
 This is a status ledger, not a claim that the research is ready for live trading.
 `VERIFIED` means checked against the live host or an executable test. `IMPLEMENTED`
 means code/config exists but still needs the stated validation. `OPEN` means no
 claim has been made and no H3 paper boundary may rely on it.
+
+## Void-Cohort Remediation Closure (2026-10-12)
+
+**Status: VERIFIED; NO REPLACEMENT QUALIFICATION BOUNDARY HAS BEEN CREATED.**
+
+The first pre-H3 qualification cohort was permanently voided after the builder
+correctly rejected duplicate deterministic event order from overlapping sealed
+windows. The replacement input surface is canonical intrinsic events exactly
+once, with window multiplicity preserved only as separately hashed provenance.
+The builder no longer accepts concatenated scientific receipts. The void closure
+is a whole-cohort ineligibility record, not an end-time that permits bridging.
+
+The exact replay produced byte-identical canonical export, exposure provenance,
+and assignment output on two runs. Full private regression status: **75
+passed**; sanitized public regression status: **58 passed**.
+Component hashes and replay evidence references are in
+[`PRE_H3_VOID_COHORT_REMEDIATION_2026-10-12.md`](PRE_H3_VOID_COHORT_REMEDIATION_2026-10-12.md).
 
 ## Pre-H3 Mechanics Closure Update (2026-10-12T15:15Z)
 
