@@ -82,11 +82,26 @@ def test_control_strata_reject_each_frozen_mismatch_and_ignore_post_entry_fields
         {"source_instance_id": "source-b"},
         {"continuity_epoch": 4},
         {"received_at_unix_ns": 61_000_000_000},
+        {"quote_mint": "not-wsol"},
+        {"mint": "target"},
         {"amount_mode": "EXACT_QUOTE_IN"},
         {"lp_fee_bps": 11},
+        {"protocol_fee_bps": 21},
+        {"coin_creator_bps": 31},
+        {"cashback_bps": 1},
+        {"buyback_bps": 1},
         {"pool_quote_raw": 10_000_000},
     ]
     for mutation in mutations:
         changed = {**control, **mutation}
         options = m.deterministic_controls([target], [target_seen, control_seen, changed], bucket_ns=m.CONTROL_BUCKET_NS, per_target=4, seed="fixed")
         assert options[m.event_key(target)] == []
+
+    # Pool age is independent of availability time: move only the observed
+    # first-seen event so the same 20-second availability bucket is preserved.
+    older_control_seen = {**control_seen, "received_at_unix_ns": -100_000_000_000}
+    options = m.deterministic_controls(
+        [target], [target_seen, older_control_seen, control],
+        bucket_ns=m.CONTROL_BUCKET_NS, per_target=4, seed="fixed",
+    )
+    assert options[m.event_key(target)] == []

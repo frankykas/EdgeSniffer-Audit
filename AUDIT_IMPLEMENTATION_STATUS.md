@@ -240,8 +240,9 @@ arbitrary 24-hour test.
 
 ## Immediate Build Order
 
-1. Independently audit `PRE_H3_ACTIONABILITY_QUALIFICATION_V1`; do not create
-   any boundary until approved.
+1. Independently audit the approved qualification specification **and the new
+   deterministic assignment builder**; do not create any boundary until this
+   final implementation audit is approved.
 2. Run that qualification once, if approved, and report PASS / INCONCLUSIVE /
    REJECT without PnL or strategy tuning.
 3. Generate compact research tables and execute the bounded offline discovery

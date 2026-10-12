@@ -1,6 +1,6 @@
 # Proposed Pre-H3 Actionability Qualification V1
 
-Status: `PROPOSED_FOR_INDEPENDENT_AUDIT_ONLY`  
+Status: `APPROVED_PENDING_ASSIGNMENT_BUILDER_FINAL_AUDIT`  
 Boundary/cohort/result created: `NO`
 
 ## Scope and Hypothesis
@@ -20,7 +20,7 @@ conservative delay.  It does not claim that an actionable match is profitable.
 ## Frozen Inputs
 
 - Base fingerprint artifact SHA-256:
-  `db08899d92f4d69d8c0234cfff9cbd05bd27dfb1365aed88d08b85f88cfc1b4`.
+  `db08899d92f4d69d8c0234cfff9cbd05bd27dfb1365aed88d08b85f88cfc1b4a`.
 - No refit, threshold adjustment, feature selection, overlay, or model-family
   comparison.
 - Fresh evidence begins only after this proposal is independently approved and
@@ -158,6 +158,30 @@ The machine-readable frozen candidate contract is
 `KEFI_PRE_H3_ACTIONABILITY_EVALUATOR_CONTRACT_V1.json`; its source hashes bind
 the reviewed matcher and evaluator implementation.  Neither artifact creates a
 boundary or a cohort.
+
+## Deterministic Assignment Builder
+
+`scripts/kefi_pre_h3_assignment_builder_v1.py` is the only supported upstream
+publisher for evaluator assignments. It requires a hash-matching frozen base
+fingerprint, an already-written boundary receipt, scientific materialization
+receipts bound to their canonical JSONL, and a verified epoch registry. It
+does not create any of those artifacts.
+
+Before delayed entry, non-tradeability, marks, or a horizon are inspected, it
+scores only the frozen pre-entry feature state, admits every match after the
+boundary warm-up, and retains deterministic first source order within each
+`(source instance, epoch, pool, 20-second bucket)`. It constructs the entire
+fingerprint non-match universe from the same pre-entry state, invokes the
+frozen control matcher, and retains every target with zero controls in
+`A_T_all`.
+
+It derives entry/120-second/hard-wall outcomes only after target/control
+identity is frozen; derives dependency clusters from the frozen source/order
+fields; and assigns eight contiguous equal-event-count chronological blocks.
+The builder publishes a manifest hash-binding the fingerprint, boundary
+receipt, every scientific receipt and canonical row file, epoch registry,
+matcher, builder, evaluator, control seed, and assignment JSONL. The builder
+does not invoke the evaluator and records `outcomes_evaluated: false`.
 
 ## Evidence and Continuity Gates
 
