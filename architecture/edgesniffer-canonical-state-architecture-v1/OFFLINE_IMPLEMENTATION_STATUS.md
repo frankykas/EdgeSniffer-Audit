@@ -1,79 +1,100 @@
-# Canonical State V1 Offline Implementation Status
+# Canonical State V1 Integrated Offline Status
 
 ## Scope respected
 
-No live service was restarted, replaced, or deployed. V8, V6 evidence, frozen
-models, 2CQ services, execution services, raw-spool policy, and historical
-evidence were not changed.
+No live service was restarted, replaced, deployed, or reconfigured. V8, V6,
+PRE_H3, frozen F01-F13/model definitions, 2CQ/execution services, historical
+evidence, and archive/release policy were untouched. No unbounded raw spool
+was enabled.
 
-## Implemented offline components
+## Offline implementation changed
 
 - `rust-exact-ledger/src/canonical_state_v1.rs`
-  - schema-bound semantic records;
-  - deterministic JCS-compatible restricted serializer: ASCII schema keys,
-    string-encoded exact quantities, explicit nulls, sorted object keys;
-  - SHA-256 hash chain over uncompressed canonical bytes;
-  - strict causal order status and `ORDER_AMBIGUOUS` rejection;
-  - append-only segment writer/manifests and recovery scanner;
-  - canonical state, bounded flow state, source sequence enforcement;
-  - coverage ledger, `UNIVERSE_INCOMPLETE` decision block, immutable failure
-    receipt type.
-- `rust-exact-ledger/src/lib.rs`: exports the offline module only.
-- Existing `rust-sidecar/src/kefi_canonical_source_v1.rs`: independently
-  tested as a restart-safe reader of the pre-existing durable source format;
-  it is not yet wired into the observer or a live service.
+  - JCS semantic serialization over schema strings/nulls/booleans/arrays;
+  - `record_sha256`, receipt/checkpoint/manifest hashes now exclude their own
+    hash member from JCS input; no empty-string self-hash convention remains;
+  - validation that `RESOLVED` causal records contain numeric slot,
+    transaction index, slash-delimited instruction path, and semantic ordinal;
+  - slot buffer/resolver that orders by `slot -> transaction_index ->
+    instruction_path -> semantic_ordinal`, never arrival order;
+  - append-only segment writer with atomic manifest publication, recovery of a
+    valid `.open` segment, arbitrary configured first sequence, and no
+    duplicate sequence on reopen;
+  - coverage ledger with allowed state kinds, immutable proof-bound
+    `UNIVERSE_COMPLETE`, and ambiguous interval overlap rejection;
+  - checkpoint integrity type and decision admission guard.
+- `rust-sidecar/src/kefi_canonical_source_v1.rs`
+  - durable-input consumer now verifies source/epoch binding, strict sequence
+    contiguity, source-frame hash presence, and a JCS/hash-bound consumer
+    checkpoint before resume.
 
-## Test results
+These source edits are offline candidates only. The existing live observer
+still owns a Yellowstone subscription and was not modified or restarted.
+
+## Tests actually run
 
 | Gate | Result |
 |---|---|
-| new canonical module unit tests | PASS: 4/4 |
-| exact-ledger full library suite | PASS: 16/16 |
-| existing sidecar canonical-reader test | PASS: 1/1 |
-| release library build | PASS |
-| JCS stable ordering / numeric rejection | PASS |
-| journal restart/no-dupe replay | PASS |
-| hash/sequence corruption rejection | PASS |
-| `ORDER_AMBIGUOUS` and `UNIVERSE_INCOMPLETE` blocking | PASS |
+| Canonical state unit suite | PASS: 7/7 |
+| Full exact-ledger library suite | PASS: 19/19 |
+| Canonical consumer unit suite | PASS: 2/2 |
+| Reverse gRPC arrival vs transaction-index ordering | PASS |
+| Invalid `RESOLVED` ordering metadata | PASS: rejected |
+| Open-segment interruption/reopen/append/rescan | PASS |
+| Non-one first canonical sequence (`40`) | PASS |
+| Wrong reopening first sequence | PASS: rejected |
+| Corrupt sealed segment/checkpoint | PASS: rejected |
+| Consumer sequence gap/reorder | PASS: rejected |
+| Coverage overlap and proof-less universe complete | PASS: rejected |
 
-## Equivalence status
+## Integration/equivalence gate
 
-**BLOCKED, not claimed.** The new writer/state engine is not yet connected to
-the real PumpSwap decoder and Pool identity resolver over retained evidence.
-Therefore the required historical old-vs-new comparison of pool identity,
-candidate membership, eligibility, F01-F13 values, causal ordering, wallet
-identity and fail-closed disposition has not been executed. No semantic
-difference has been observed because no valid comparison run exists yet; this
-is not equivalent to a zero-difference result.
+**BLOCKED BEFORE REPLAY; no parity claim is made.** The currently active V8
+root contains health, boundaries, tracked-wallet candidates, and promoted
+window products, but no durable complete all-PumpSwap frame journal suitable
+for the architectural canonical reader. It is therefore not a valid input to
+reconstruct the complete candidate universe or replay F01-F13.
 
-## Storage benchmark
+The existing observer remains a direct Yellowstone subscriber. It cannot be
+truthfully called migrated until a future, separately deployed canonical
+producer emits the complete semantic stream with causal-order metadata and the
+observer is refactored onto that stream. The approved restrictions prohibit
+deploying/restarting V8 to make that source available in this task.
 
-Read-only baseline output:
-`/mnt/edgesniffer-canonical-offline-v1/semantic-storage-benchmark-v1.json`
+Consequently the following gates are intentionally **not run**:
 
-- sealed legacy compact artifacts measured: 9;
-- rows: 82;
-- compressed bytes: 22,267,596;
-- weighted compressed bytes/row: 271,556.
+- old vs new full retained-evidence replay #1 and #2;
+- restart-from-checkpoint equivalence;
+- F01-F13/candidate/wallet-decision/snapshot parity;
+- actual canonical journal storage/resource benchmark;
+- integrated disconnect, producer/consumer restart, disk-pressure and
+  universe-recovery fault matrix.
 
-These are legacy choice-snapshot artifacts containing candidate sets, not the
-new canonical event journal. They do not establish journal GiB/hour, new
-bytes/event, checkpoint size, decision package size, or live write bandwidth.
-Those measurements remain blocked on the real decoder/state adapter and an
-equivalence-passing replay.
+There are no measured semantic differences because no scientifically valid
+comparison input exists. This is **not** a zero-difference result.
 
-## Resources and recovery
+## Storage/resources
 
-The small unit replay completed in under a second. No representative CPU/RAM
-or retained-evidence replay throughput measurement exists yet, so no capacity
-claim is made. The release library artifact is 2,804,372 bytes. Recovery is
-functionally tested only on a synthetic two-record segment; real historical
-recovery performance remains unmeasured.
+The legacy `271,556` compressed bytes/row result remains explicitly excluded:
+it is a choice-snapshot artifact rate, not a Canonical State event-journal
+rate. No canonical bytes/event, GiB/hour/day, p50/p95/burst CPU/RAM, checkpoint
+size, decision-package size, replay throughput, or recovery time has been
+measured on representative retained evidence.
 
-## Shadow-live verdict
+## Remaining hard blockers
 
-**NOT READY FOR SHADOW-LIVE.** Required blockers are: decoder/Pool-resolver
-adapter, complete F01-F13 state parity, deterministic candidate-universe
-reconstruction, wallet decision binding, full historical equivalence twice plus
-restart, representative storage benchmark, and the complete fault matrix over
-the integrated pipeline.
+1. Build the new canonical semantic producer and durable bounded journal in a
+   future controlled deployment plan; it must include authoritative causal
+   transaction/instruction ordering, not gRPC arrival ordering.
+2. Refactor the PumpSwap decoder/Pool resolver/state engine into reusable
+   library code and make the observer consume only the canonical journal.
+3. Capture a complete retained all-supported-pool interval from that producer.
+4. Run the required double replay, checkpoint recovery replay, full fault
+   matrix, and real sustained/burst benchmark. Any semantic mismatch blocks
+   progression and must emit its counterexample.
+
+## Verdict
+
+**NOT READY FOR SHADOW-LIVE.** The low-level safety primitives have passed
+offline unit validation. The integrated scientific pipeline has not yet earned
+equivalence or resource claims, and no live operation was started.
