@@ -11,7 +11,7 @@ Previously sealed decision packages remain valid. Future observations are paused
 1. Stop acceptance, seal current journal segment and emit failure receipt.
 2. If exact provider replay is available, replay into a *recovery verifier*; accept only if identities/sequences prove no missing/contradictory records. Otherwise the interval stays excluded and is written as a blackout interval in the coverage ledger.
 3. Create a new source instance/epoch with new boundary receipt and a recovery interval in the coverage ledger.
-4. Restore exact checkpoint only if it binds to the proven contiguous replay. Otherwise bootstrap a new candidate universe as specified in `CANDIDATE_UNIVERSE_RECOVERY.md`; pre-gap state is never assumed continuous.
-5. Resume decision-local acceptance only when candidate universe, wallet ledger and all required feature states are valid at that decision boundary. Record warm-up/exclusion intervals in the coverage ledger.
+4. Restore exact checkpoint only if it binds to the proven contiguous replay. Otherwise run the complete-universe proof specified in `CANDIDATE_UNIVERSE_RECOVERY.md`; pre-gap state is never assumed continuous.
+5. Resume decision-local acceptance only when candidate universe, wallet ledger and all required feature states are valid at that decision boundary. Until a full-universe proof passes, record `UNIVERSE_INCOMPLETE` and admit no scientific decision. Record warm-up/exclusion intervals in the coverage ledger.
 
 Decision-local validity is a future protocol: a later hard wall does not retroactively invalidate an already sealed decision. It never reclassifies V6.

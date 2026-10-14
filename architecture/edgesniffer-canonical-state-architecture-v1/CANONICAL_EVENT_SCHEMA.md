@@ -12,7 +12,13 @@ For transaction records without stable instruction index, retain `event_payload_
 
 Scientific pre-action ordering uses `(slot, transaction_index, outer_instruction_index, inner_instruction_path, semantic_ordinal)`, derived from authoritative transaction metadata. Arrival time is metadata only and never breaks a causal tie. A record lacking a required transaction index or instruction path is retained as a diagnostic semantic record but cannot be used to establish a before/after relationship. If the selected-wallet action and any state-affecting event share a slot and their relative transaction/instruction order cannot be resolved, every affected candidate and decision is rejected with `ORDER_AMBIGUOUS`. No timestamp, provider order, lexical signature order, or sequence number may repair that ambiguity.
 
-## Record envelope (canonical JSON -> zstd framed segment)
+## Byte-level deterministic serialization
+
+The hash input for every semantic record, receipt, checkpoint manifest and decision package is the UTF-8 byte sequence produced by **RFC 8785 JSON Canonicalization Scheme (JCS)** over the schema-versioned object. SHA-256 is taken over those uncompressed canonical bytes. Zstandard is a storage transport only: compression parameters, frame boundaries and compressed bytes never define semantic identity.
+
+Conforming writers must use JSON strings for every Solana public key, signature, hash and identifier; JSON integers only for exact values within the RFC 8785 interoperable integer range; decimal strings for `u64`, lamports, raw token quantities, sequence numbers and nanoseconds outside that range; JSON booleans for flags; explicit JSON `null` for absent optional fields; no non-finite numbers; no omitted field in place of a defined nullable field; and no duplicate keys. The schema/version, parser version and field names are part of the canonical object. Arrays use frozen schema order; maps are canonicalized by JCS member ordering. A schema change requires a new schema identifier and cannot rewrite prior hashes.
+
+## Record envelope (JCS bytes -> zstd framed segment)
 
 ```json
 {
@@ -30,7 +36,7 @@ Scientific pre-action ordering uses `(slot, transaction_index, outer_instruction
   "pool_base_raw":0, "pool_quote_raw":0, "quote_delta_raw":0,
   "fee_tuple":[0,0,0,0,0], "layout":"...",
   "pool_identity_ref":"sha256...", "parser_version":"sha256...",
-  "previous_record_sha256":"...", "record_sha256":"..."
+  "previous_record_sha256":"...", "record_sha256":"sha256(JCS UTF-8 bytes excluding record_sha256)"
 }
 ```
 
@@ -38,6 +44,6 @@ The final schema has nullable fields only where a semantic type cannot own them.
 
 ## Segments and durability
 
-Append records to fixed-size/time-bounded local segments on the kEFi hot volume. Each segment has a header (source instance, epoch, first sequence), record hash chain, compressed payload SHA-256, footer (last sequence, record count, byte count, segment SHA-256) and atomic publish. A journal manifest hash-chains sealed segments. `fdatasync` occurs at a bounded group-commit interval; publication is recoverable by scanning a partial segment and verifying sequence/hash continuity.
+Append records to fixed-size/time-bounded local segments on the kEFi hot volume. Each segment has a header (source instance, epoch, first sequence), record hash chain, compressed-payload SHA-256 for transport integrity, footer (last sequence, record count, canonical-uncompressed byte count, compressed byte count, segment SHA-256) and atomic publish. A journal manifest hash-chains the JCS-derived record/segment identities. `fdatasync` occurs at a bounded group-commit interval; publication is recoverable by decompressing a partial segment and verifying canonical sequence/hash continuity.
 
 Full raw provider frames stay in bounded RAM and optional short-TTL diagnostics. `raw_frame_sha256` permits evidence binding without making raw payload a permanent dependency.

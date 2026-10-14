@@ -23,6 +23,8 @@ Fast and canonical paths may observe the same chain, but only canonical journal 
 
 Every future epoch additionally writes to an immutable scientific coverage ledger. It records valid time, blackout/recovery/warm-up intervals, accepted decisions, excluded decisions, and explicit exclusion reasons. This makes observability bias measurable rather than silently hidden.
 
+After an unrecoverable gap, admission stays closed as `UNIVERSE_INCOMPLETE`. Marking pre-gap pools unknown and excluding them is never sufficient: an accepted decision requires proof that the **complete frozen candidate universe** is known at its boundary.
+
 ## Non-goals
 
 - No implementation or deployment is authorized by this design.

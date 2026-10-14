@@ -12,6 +12,10 @@ This revision adds the strict Solana causal-ordering contract, exact post-gap ca
 
 New documents: `CANDIDATE_UNIVERSE_RECOVERY.md` and `SCIENTIFIC_COVERAGE_LEDGER.md`.
 
+## Revision: complete-universe proof and JCS hashing
+
+This revision forbids scientific admission after an unrecoverable gap until exact replay or a sealed full-universe recovery proof exists. It also freezes RFC 8785/JCS UTF-8 bytes as the uncompressed semantic hash input; compression is explicitly storage-only.
+
 ## File hashes
 - `CANONICAL_EVENT_SCHEMA.md`: `ab087bdc4b6e2e82f26d7c5d765aaa14291bfae8caeef99dc815c65be2d6142f`
 - `CHECKPOINT_SCHEMA.md`: `b0fa8d800a88c47aed1b057c2323719269c08bb9c098792149e8f245ad89b010`
