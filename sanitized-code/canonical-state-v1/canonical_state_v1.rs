@@ -248,7 +248,10 @@ impl CoverageLedger {
             let Ok((start, end)) = record.range() else { return false; };
             if start > sequence { continue; }
             if matches!(record.kind.as_str(), "BLACKOUT" | "RECOVERY" | "WARMUP" | "UNIVERSE_INCOMPLETE") && sequence <= end { return false; }
-            if record.kind == "UNIVERSE_COMPLETE" && start <= sequence && self.universe_proof_by_epoch.get(epoch) == Some(&record.details_hash) { complete = true; }
+            // This is a historical query.  The proof that applied at the
+            // decision boundary is immutable; a later gap or later proof may
+            // affect later boundaries, but cannot revise this one.
+            if record.kind == "UNIVERSE_COMPLETE" && start <= sequence && !record.details_hash.is_empty() { complete = true; }
         }
         complete
     }
@@ -538,6 +541,20 @@ mod tests {
         assert!(ledger.universe_complete_at("epoch", 4));
         ledger.append("epoch", "BLACKOUT", 5, 8, Some("SOURCE_GAP"), "gap-hash")?;
         assert!(!ledger.universe_complete_at("epoch", 6));
+        Ok(())
+    }
+
+    #[test]
+    fn later_gap_cannot_rewrite_an_earlier_complete_boundary() -> Result<()> {
+        let mut ledger = CoverageLedger::default();
+        ledger.append("epoch", "UNIVERSE_COMPLETE", 10, 10, None, "immutable-proof-a")?;
+        ledger.append("epoch", "ACCEPTED_DECISION", 12, 12, None, "decision-a")?;
+        assert!(ledger.universe_complete_at("epoch", 12));
+        ledger.append("epoch", "BLACKOUT", 20, 30, Some("SOURCE_GAP"), "gap-a")?;
+        ledger.append("epoch", "UNIVERSE_INCOMPLETE", 31, 31, Some("RECOVERY_REQUIRED"), "recovery-a")?;
+        assert!(ledger.universe_complete_at("epoch", 12));
+        assert!(!ledger.universe_complete_at("epoch", 25));
+        assert!(!ledger.universe_complete_at("epoch", 31));
         Ok(())
     }
 
