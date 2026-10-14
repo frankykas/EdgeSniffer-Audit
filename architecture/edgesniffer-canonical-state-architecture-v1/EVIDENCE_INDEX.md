@@ -6,6 +6,12 @@ This bundle is an implementation design based on the read-only architecture doss
 
 No credentials, endpoints, private keys, feature coefficients, rankings, PnL, evaluator results, code changes, deployments, or service operations are included.
 
+## Revision: strict ordering, recovery, coverage, and decision raw bytes
+
+This revision adds the strict Solana causal-ordering contract, exact post-gap candidate-universe recovery rules, immutable scientific coverage ledger, and permanent retention of the tracked-wallet decision transaction's raw bytes inside sealed decision evidence. It does not change any production source, historical evidence, or frozen model.
+
+New documents: `CANDIDATE_UNIVERSE_RECOVERY.md` and `SCIENTIFIC_COVERAGE_LEDGER.md`.
+
 ## File hashes
 - `CANONICAL_EVENT_SCHEMA.md`: `ab087bdc4b6e2e82f26d7c5d765aaa14291bfae8caeef99dc815c65be2d6142f`
 - `CHECKPOINT_SCHEMA.md`: `b0fa8d800a88c47aed1b057c2323719269c08bb9c098792149e8f245ad89b010`

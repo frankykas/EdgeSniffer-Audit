@@ -17,3 +17,5 @@ engine_binary_hash, parser_schema_hash, checkpoint_payload_hash
 Write compressed state to a temporary file, `fsync`, write checksum/metadata, `fsync`, atomically rename, then append a checkpoint receipt to the journal manifest. A restart may restore only when source instance/epoch, journal tail and checkpoint hash match. Otherwise it seals the epoch and starts a new one.
 
 Immediate validity after restoration is allowed only for state whose complete inputs are in the checkpoint: F01–F03, F05–F13 and candidate eligibility may resume if exact rolling deques/lifetime provenance are restored. If any required state is absent/corrupt, mark affected pools invalid; require 5/20/60-second clean warm-up for rolling fields and exclude unprovable lifetime fields until rebuilt.
+
+The checkpoint also contains the coverage-ledger tail hash and open interval state. A checkpoint can speed recovery, but cannot convert an unavailable exact replay interval into continuous coverage.

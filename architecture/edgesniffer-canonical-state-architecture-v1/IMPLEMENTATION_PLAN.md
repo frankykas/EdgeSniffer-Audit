@@ -1,9 +1,9 @@
 # Phased Implementation Plan (No Deployment Authorized)
 
-1. **Offline schema/writer:** add canonical semantic record, journal segments, hash-chain manifest, recovery scanner and immutable failure receipt.
+1. **Offline schema/writer:** add canonical semantic record, strict causal-order resolver, journal segments, hash-chain manifest, recovery scanner and immutable failure receipt.
 2. **State migration:** extract existing observer state into a canonical-engine crate; preserve decoder and Pool resolver semantics.
 3. **Wallet/candidate binding:** make wallet index and candidate universe consume canonical sequence only; remove observer direct gRPC ownership.
-4. **Checkpointing:** atomic checkpoint/restore with per-feature validity and deterministic state serialization.
+4. **Checkpointing and coverage:** atomic checkpoint/restore with per-feature validity, deterministic state serialization, candidate-universe recovery and immutable coverage ledger.
 5. **Historical equivalence:** execute the full old/new plan twice and after restart; resolve every difference.
 6. **Storage benchmark:** measure compact journal and decision packages on calm/burst retained data; set actual quotas.
 7. **Shadow live:** subscribe once through the new receiver, run new state engine without scientific admission, compare state hashes with the legacy observer where their intervals overlap.

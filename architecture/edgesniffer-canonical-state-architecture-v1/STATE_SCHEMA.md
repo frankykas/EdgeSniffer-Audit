@@ -13,6 +13,6 @@ One incremental engine consumes only canonical semantic records in exact sequenc
 | observed-wallet ledger | append-only wallet identity ledger with tail hash | durable separate file, transactionally bound to journal seq |
 | observer `sequence` | canonical sequence only | never per-consumer counter |
 
-The engine applies each event once. It exposes read-only `state_at(sequence)` only at committed boundaries. A decision at sequence `N` reads candidate state after all records `< N` and before the wallet-action record at `N`; the teacher action is then applied separately.
+The engine applies each event once. It exposes read-only `state_at(sequence)` only at committed boundaries. A decision at sequence `N` reads candidate state after every **causally earlier** resolved event and before the wallet-action instruction; the teacher action is then applied separately. If same-slot state cannot be causally ordered, `state_at` returns invalid for scientific admission rather than using arrival order.
 
 No model is inside this engine. It produces frozen semantic state and feature vectors only after the candidate universe has been certified complete for that boundary.
