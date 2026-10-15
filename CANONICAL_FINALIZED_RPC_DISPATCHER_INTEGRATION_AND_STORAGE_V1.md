@@ -33,6 +33,15 @@ They are not scientific evidence, but this task did not delete them.
 NFS has only about 92.3 GB free and is not a safe ingestion dependency. No
 archive/release action was performed or implied.
 
+## Additional Live Gate
+
+The read-only service check found
+`edgesniffer-kefi-full-meta-capture-first-v8.service` inactive. It stopped
+cleanly at `2026-10-15T15:47:16Z` with systemd status `15`/`Result=success`;
+the log records a stop request, not a crash. The V8 watchdog and evidence
+ledger remain active. This task does not authorize restarting V8, so this is a
+second live-canary blocker independent of storage.
+
 ## Exact Approval-Gated Cleanup Candidates
 
 ```sh
