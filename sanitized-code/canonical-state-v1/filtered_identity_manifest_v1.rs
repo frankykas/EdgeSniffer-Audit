@@ -159,6 +159,8 @@ impl FilteredIdentityManifestWriter {
         let mut next_receive_sequence = first_receive_sequence;
         let mut tail = String::new();
         let mut identities = BTreeSet::new();
+        let mut valid_tails = BTreeMap::new();
+        valid_tails.insert((next_manifest_sequence, next_receive_sequence), tail.clone());
         if path.exists() {
             for line in BufReader::new(File::open(&path)?).lines() {
                 let record: FilteredIdentity = serde_json::from_str(&line?)?;
@@ -170,17 +172,25 @@ impl FilteredIdentityManifestWriter {
                 tail = record.record_sha256;
                 next_manifest_sequence += 1;
                 next_receive_sequence += 1;
+                valid_tails.insert((next_manifest_sequence, next_receive_sequence), tail.clone());
             }
         }
+        let mut checkpoint_needs_repair = !checkpoint_path.exists();
         if checkpoint_path.exists() {
             let checkpoint: ManifestCheckpoint = serde_json::from_slice(&fs::read(&checkpoint_path)?)?;
             checkpoint.validate()?;
-            if checkpoint.epoch_id != epoch_id || checkpoint.source_instance_id != source_instance_id || checkpoint.continuity_epoch != continuity_epoch || checkpoint.next_manifest_sequence.parse::<u64>()? != next_manifest_sequence || checkpoint.next_receive_sequence.parse::<u64>()? != next_receive_sequence || checkpoint.tail_record_sha256 != tail {
+            let checkpoint_manifest_sequence: u64 = checkpoint.next_manifest_sequence.parse()?;
+            let checkpoint_receive_sequence: u64 = checkpoint.next_receive_sequence.parse()?;
+            let checkpoint_tail = valid_tails.get(&(checkpoint_manifest_sequence, checkpoint_receive_sequence));
+            if checkpoint.epoch_id != epoch_id || checkpoint.source_instance_id != source_instance_id || checkpoint.continuity_epoch != continuity_epoch || checkpoint_tail != Some(&checkpoint.tail_record_sha256) {
                 bail!("MANIFEST_CHECKPOINT_RECOVERY_CONFLICT")
             }
+            checkpoint_needs_repair = checkpoint_manifest_sequence != next_manifest_sequence || checkpoint_receive_sequence != next_receive_sequence || checkpoint.tail_record_sha256 != tail;
         }
         let bytes_written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        Ok(Self { path, checkpoint_path, epoch_id: epoch_id.to_owned(), source_instance_id: source_instance_id.to_owned(), continuity_epoch: continuity_epoch.to_owned(), next_manifest_sequence, next_receive_sequence, tail, bytes_written, identities, policy })
+        let writer = Self { path, checkpoint_path, epoch_id: epoch_id.to_owned(), source_instance_id: source_instance_id.to_owned(), continuity_epoch: continuity_epoch.to_owned(), next_manifest_sequence, next_receive_sequence, tail, bytes_written, identities, policy };
+        if checkpoint_needs_repair { writer.persist_checkpoint()?; }
+        Ok(writer)
     }
 
     pub fn append(&mut self, slot: u64, signature: &str, received_at_unix_ns: u128, observed_arrival_index: Option<u64>, source_frame_sha256: &str) -> Result<FilteredIdentity> {
@@ -210,7 +220,9 @@ impl FilteredIdentityManifestWriter {
     fn persist_checkpoint(&self) -> Result<()> {
         let checkpoint = ManifestCheckpoint { schema: FILTERED_IDENTITY_CHECKPOINT_SCHEMA.to_owned(), epoch_id: self.epoch_id.clone(), source_instance_id: self.source_instance_id.clone(), continuity_epoch: self.continuity_epoch.clone(), next_manifest_sequence: self.next_manifest_sequence.to_string(), next_receive_sequence: self.next_receive_sequence.to_string(), tail_record_sha256: self.tail.clone(), checkpoint_sha256: String::new() }.seal()?;
         let temporary = self.checkpoint_path.with_extension("tmp");
-        fs::write(&temporary, jcs_bytes(&serde_json::to_value(&checkpoint)?)?)?;
+        let mut file = File::create(&temporary)?;
+        file.write_all(&jcs_bytes(&serde_json::to_value(&checkpoint)?)?)?;
+        file.sync_all()?;
         fs::rename(temporary, &self.checkpoint_path)?;
         Ok(())
     }
@@ -276,14 +288,32 @@ impl FinalizedBlockRegistry {
 }
 
 #[derive(Clone, Debug)]
+pub struct SlotCoverageProof {
+    pub slot: String,
+    /// `RECONCILED_BLOCK` requires an exact reconciliation receipt. A skipped
+    /// slot must be explicitly evidenced as `FINALIZED_SKIPPED`; absence is
+    /// never treated as a skipped slot.
+    pub status: String,
+    pub block_identity: Option<String>,
+    pub proof_reference: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct IntervalCompleteness {
     pub epoch_id: String,
     pub source_instance_id: String,
     pub continuity_epoch: String,
     pub first_capture_slot: String,
+    pub last_capture_slot: String,
     pub first_capture_slot_reconciled: bool,
     pub source_restart_or_gap_observed: bool,
     pub block_receipts: Vec<ReconciliationReceipt>,
+    /// Complete slot coverage is independent of filtered transaction arrival.
+    /// Every slot in the claimed interval must be a reconciled block or an
+    /// authoritative finalized-skipped proof.
+    pub slot_coverage: Vec<SlotCoverageProof>,
+    /// Filtered identities cannot exist in an explicitly skipped slot.
+    pub observed_filtered_slots: BTreeSet<String>,
 }
 
 impl IntervalCompleteness {
@@ -293,17 +323,39 @@ impl IntervalCompleteness {
     /// matched exactly. Slots absent from a provider result are failures, not
     /// gaps that a later slot can silently cover.
     pub fn verify(&self) -> Result<()> {
-        if self.first_capture_slot.is_empty() || !self.first_capture_slot_reconciled { bail!("CAPTURE_START_NOT_RECONCILED") }
+        if self.first_capture_slot.is_empty() || self.last_capture_slot.is_empty() || !self.first_capture_slot_reconciled { bail!("CAPTURE_START_NOT_RECONCILED") }
         if self.source_restart_or_gap_observed { bail!("INTERVAL_CONTINUITY_BREAK") }
         if self.block_receipts.is_empty() { bail!("INTERVAL_NO_BLOCK_PROOFS") }
+        let first: u64 = self.first_capture_slot.parse().context("CAPTURE_START_SLOT_INVALID")?;
+        let last: u64 = self.last_capture_slot.parse().context("CAPTURE_END_SLOT_INVALID")?;
+        if last < first { bail!("CAPTURE_SLOT_RANGE_INVALID") }
+        let expected_coverage = last.checked_sub(first).and_then(|value| value.checked_add(1)).context("CAPTURE_SLOT_RANGE_OVERFLOW")? as usize;
+        if self.slot_coverage.len() != expected_coverage { bail!("INTERVAL_SLOT_COVERAGE_INCOMPLETE") }
+        let mut receipts_by_slot = BTreeMap::new();
         let mut saw_start = false;
         for receipt in &self.block_receipts {
             if receipt.schema != FINALIZED_RECONCILIATION_SCHEMA || receipt.receipt_sha256 != hash_excluding_field(receipt, "receiptSha256")? { bail!("RECONCILIATION_RECEIPT_INVALID") }
             if receipt.epoch_id != self.epoch_id || receipt.source_instance_id != self.source_instance_id || receipt.continuity_epoch != self.continuity_epoch { bail!("INTERVAL_EPOCH_BINDING_MISMATCH") }
             if receipt.disposition != "MATCHED" || receipt.reason_code.is_some() { bail!("INTERVAL_RECONCILIATION_NOT_COMPLETE") }
+            if receipts_by_slot.insert(receipt.slot.clone(), receipt).is_some() { bail!("INTERVAL_DUPLICATE_BLOCK_RECEIPT") }
             if receipt.slot == self.first_capture_slot { saw_start = true; }
         }
         if !saw_start { bail!("CAPTURE_START_PROOF_MISSING") }
+        for (offset, coverage) in self.slot_coverage.iter().enumerate() {
+            let expected_slot = first.checked_add(offset as u64).context("CAPTURE_SLOT_RANGE_OVERFLOW")?.to_string();
+            if coverage.slot != expected_slot || coverage.proof_reference.is_empty() { bail!("INTERVAL_SLOT_COVERAGE_INVALID") }
+            match coverage.status.as_str() {
+                "RECONCILED_BLOCK" => {
+                    let receipt = receipts_by_slot.remove(&coverage.slot).context("INTERVAL_BLOCK_RECEIPT_MISSING")?;
+                    if coverage.block_identity.as_deref() != Some(receipt.block_identity.as_str()) { bail!("INTERVAL_BLOCK_IDENTITY_MISMATCH") }
+                }
+                "FINALIZED_SKIPPED" => {
+                    if coverage.block_identity.is_some() || self.observed_filtered_slots.contains(&coverage.slot) { bail!("INTERVAL_SKIPPED_SLOT_CONFLICT") }
+                }
+                _ => bail!("INTERVAL_SLOT_STATUS_UNSUPPORTED"),
+            }
+        }
+        if !receipts_by_slot.is_empty() { bail!("INTERVAL_UNCOVERED_BLOCK_RECEIPT") }
         Ok(())
     }
 }
@@ -426,16 +478,71 @@ mod tests {
     }
 
     #[test]
+    fn stale_checkpoint_after_a_synced_append_recovers_from_verified_journal_tail() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw-a").unwrap();
+        let checkpoint_path = root.path().join("epoch-a.filtered-identities.checkpoint.json");
+        let stale_checkpoint = fs::read(&checkpoint_path).unwrap();
+        out.append(10, "sig-10-2", 2, None, "raw-b").unwrap();
+        fs::write(&checkpoint_path, stale_checkpoint).unwrap();
+        drop(out);
+        let mut resumed = writer(root.path());
+        resumed.append(11, "sig-11-0", 3, None, "raw-c").unwrap();
+        assert_eq!(all_records(root.path()).len(), 3);
+    }
+
+    #[test]
     fn interval_proof_requires_reconciled_start_and_unbroken_epoch() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
         out.append(10, "sig-10-0", 1, None, "raw").unwrap();
         let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
-        let complete = IntervalCompleteness { epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(), first_capture_slot: "10".into(), first_capture_slot_reconciled: true, source_restart_or_gap_observed: false, block_receipts: vec![receipt.clone()] };
+        let complete = IntervalCompleteness {
+            epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(),
+            first_capture_slot: "10".into(), last_capture_slot: "10".into(), first_capture_slot_reconciled: true,
+            source_restart_or_gap_observed: false, block_receipts: vec![receipt.clone()],
+            slot_coverage: vec![SlotCoverageProof { slot: "10".into(), status: "RECONCILED_BLOCK".into(), block_identity: Some(receipt.block_identity.clone()), proof_reference: "finalized-getBlock:10".into() }],
+            observed_filtered_slots: ["10".to_owned()].into_iter().collect(),
+        };
         complete.verify().unwrap();
         let broken = IntervalCompleteness { source_restart_or_gap_observed: true, ..complete.clone() };
         assert!(broken.verify().unwrap_err().to_string().contains("CONTINUITY"));
         let no_start = IntervalCompleteness { first_capture_slot_reconciled: false, ..complete };
         assert!(no_start.verify().unwrap_err().to_string().contains("CAPTURE_START"));
+    }
+
+    #[test]
+    fn interval_cannot_claim_coverage_from_a_partial_receipt_list() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
+        let incomplete = IntervalCompleteness {
+            epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(),
+            first_capture_slot: "10".into(), last_capture_slot: "11".into(), first_capture_slot_reconciled: true,
+            source_restart_or_gap_observed: false, block_receipts: vec![receipt],
+            slot_coverage: vec![SlotCoverageProof { slot: "10".into(), status: "RECONCILED_BLOCK".into(), block_identity: Some("block-10".into()), proof_reference: "finalized-getBlock:10".into() }],
+            observed_filtered_slots: ["10".to_owned()].into_iter().collect(),
+        };
+        assert!(incomplete.verify().unwrap_err().to_string().contains("COVERAGE_INCOMPLETE"));
+    }
+
+    #[test]
+    fn finalized_skipped_slot_requires_authoritative_status_and_no_identity() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
+        let valid = IntervalCompleteness {
+            epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(),
+            first_capture_slot: "10".into(), last_capture_slot: "11".into(), first_capture_slot_reconciled: true,
+            source_restart_or_gap_observed: false, block_receipts: vec![receipt.clone()],
+            slot_coverage: vec![
+                SlotCoverageProof { slot: "10".into(), status: "RECONCILED_BLOCK".into(), block_identity: Some(receipt.block_identity), proof_reference: "finalized-getBlock:10".into() },
+                SlotCoverageProof { slot: "11".into(), status: "FINALIZED_SKIPPED".into(), block_identity: None, proof_reference: "finalized-slot-status:11".into() },
+            ],
+            observed_filtered_slots: ["10".to_owned()].into_iter().collect(),
+        };
+        valid.verify().unwrap();
+        let invalid = IntervalCompleteness { observed_filtered_slots: ["10".to_owned(), "11".to_owned()].into_iter().collect(), ..valid };
+        assert!(invalid.verify().unwrap_err().to_string().contains("SKIPPED_SLOT_CONFLICT"));
     }
 
     #[test]

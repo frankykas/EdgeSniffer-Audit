@@ -133,3 +133,14 @@ state mutation. See `INSTRUCTION_PATH_DECODER_REMAINING_V1.md`.
 **READY FOR LIVE CANARY: NO.** A live adapter, a durable per-slot manifest
 integration, a bounded RPC dispatcher, provider-size validation, and exact
 instruction-path decoder work remain mandatory before any isolated canary.
+
+## Post-commit audit correction
+
+The independent decoder-gate review found that the original
+`IntervalCompleteness` object validated the receipts supplied to it but did
+not itself prove every slot through its claimed interval end was represented.
+That was a completeness overclaim. The subsequent offline correction requires
+contiguous `RECONCILED_BLOCK` or authoritative `FINALIZED_SKIPPED` coverage,
+rejects filtered identities in a skipped slot, and adds an interrupted
+append/stale-checkpoint recovery regression. See
+`PUMP_INSTRUCTION_PATH_DECODER_V1_REPORT.md` for the corrected gate status.

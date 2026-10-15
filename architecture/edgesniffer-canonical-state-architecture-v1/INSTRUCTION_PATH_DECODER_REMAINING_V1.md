@@ -1,4 +1,4 @@
-# Canonical State V1 - Remaining Instruction-Path Decoder Work
+# Canonical State V1 - Instruction-Path Decoder Status
 
 Filtered-identity reconciliation answers only this question:
 
@@ -8,7 +8,10 @@ It does **not** answer:
 
 `Which exact outer instruction, inner instruction path, and semantic event produced a state mutation?`
 
-## Required implementation changes
+## Offline implementation completed
+
+`sanitized-code/canonical-state-v1/pump_instruction_path_decoder_v1.rs`
+now implements the following offline primitive:
 
 1. Accept the complete transaction message and metadata together, not logs
    alone.
@@ -31,6 +34,25 @@ It does **not** answer:
    multi-mint routed transactions, loaded-address transactions, failed
    transactions, and intentionally ambiguous logs.
 
+It requires a unique message-plus-metadata invocation match. Logs only
+corroborate the active program at the event's recorded log position; they are
+never used to create a path. Ambiguous, malformed, failed, or incomplete
+records are rejected before scientific-state release.
+
+## Remaining integration work
+
+1. Build an offline adapter from the retained Yellowstone full-meta protobuf
+   transaction/message/meta types into the decoder input types.
+2. Bind the existing PumpSwap event decoder's side/discriminator evidence to
+   `SemanticEventInput` and preserve its raw event provenance.
+3. Validate the adapter against retained full Pump/PumpSwap fixtures. The
+   current retained fixture listed in the source tree is a 2CQ protobuf, not
+   an eligible Pump/PumpSwap full-transaction fixture, so this item is
+   currently blocked by fixture availability rather than inferred complete.
+4. Only after that adapter and a finalized complete-interval proof exist may a
+   caller mark an event `RESOLVED`; candidate-universe completeness remains a
+   separate required proof.
+
 ## Explicit non-claims
 
 - A Yellowstone arrival index is not canonical transaction order.
@@ -41,6 +63,8 @@ It does **not** answer:
 
 ## Gate
 
-Semantic ordering remains **BLOCKED** until every emitted Pump/PumpSwap event
-has a verified instruction path or the transaction is excluded with an
-immutable failure receipt.
+The decoder primitive is **ready for offline adapter integration**, but
+semantic ordering remains **BLOCKED for a live canary** until every emitted
+Pump/PumpSwap event has a verified instruction path against retained/full-meta
+fixtures and a complete captured interval plus complete candidate-universe
+proof exist.
