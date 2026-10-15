@@ -37,9 +37,16 @@ The canary dispatched finalized RPC reconciliation too eagerly over a high-volum
 
 This does **not** establish a provider completeness failure, and it does **not** establish a scientifically valid interval. It proves the release gate refused to claim one.
 
-## Required Repair Before Another Canary
+## Dispatcher Integration
 
-Replace the canary's eager per-update polling with a bounded slot dispatcher that:
+`finalized_rpc_dispatcher_v1.rs` now supplies the bounded per-slot state
+machine used by the canary integration work. It has explicit `COLLECTING`,
+`READY_TO_RECONCILE`, `RETRY_PENDING`, `MATCHED`, and `FAILED` states;
+bounded exponential retry; capacity backpressure; and removal of completed
+slots only after their terminal result is durable. Its deterministic tests
+cover delayed identities and queue saturation.
+
+The live adapter must:
 
 1. journals every identity immediately;
 2. retains a bounded active-slot table;
@@ -50,7 +57,7 @@ Replace the canary's eager per-update polling with a bounded slot dispatcher tha
 
 The retry condition must not be an inactivity-based scientific ordering barrier. A slot is released solely on exact finalized set/index equality; an unresolved slot remains unreleased and makes the interval unusable.
 
-## Verdict
+## Current Verdict
 
 `FALLBACK_CANARY_BLOCKED`
 
