@@ -1,0 +1,468 @@
+//! Offline-only durable identity manifest and finalized-block reconciliation.
+//!
+//! The manifest is deliberately written *before* wallet/candidate selection.
+//! It preserves Yellowstone arrival provenance without treating arrival or an
+//! observed provider index as canonical Solana order.  The reconciler compares
+//! that complete received identity set with a finalized block-derived,
+//! program/account-filtered identity set.  Any mismatch is a hard failure.
+
+use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::canonical_state_v1::{hash_excluding_field, jcs_bytes};
+
+pub const FILTERED_IDENTITY_SCHEMA: &str = "EDGESNIFFER_FILTERED_IDENTITY_MANIFEST_V1";
+pub const FILTERED_IDENTITY_CHECKPOINT_SCHEMA: &str = "EDGESNIFFER_FILTERED_IDENTITY_CHECKPOINT_V1";
+pub const FINALIZED_RECONCILIATION_SCHEMA: &str = "EDGESNIFFER_FINALIZED_RECONCILIATION_V1";
+pub const MAX_IDENTITIES_PER_SLOT: usize = 4_096;
+pub const MAX_PENDING_SLOTS: usize = 32;
+
+#[derive(Clone, Debug)]
+pub struct RpcBudget {
+    pub maximum_requests: u64,
+    pub maximum_concurrency: usize,
+    pub minimum_interval_ms: u64,
+    used_requests: u64,
+}
+
+impl RpcBudget {
+    pub fn new(maximum_requests: u64, maximum_concurrency: usize, minimum_interval_ms: u64) -> Result<Self> {
+        if maximum_requests == 0 || maximum_concurrency == 0 { bail!("RPC_BUDGET_INVALID") }
+        Ok(Self { maximum_requests, maximum_concurrency, minimum_interval_ms, used_requests: 0 })
+    }
+    pub fn consume_one(&mut self) -> Result<()> {
+        if self.used_requests >= self.maximum_requests { bail!("RPC_REQUEST_BUDGET_EXHAUSTED") }
+        self.used_requests += 1;
+        Ok(())
+    }
+    pub fn used_requests(&self) -> u64 { self.used_requests }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilteredIdentity {
+    pub schema: String,
+    pub manifest_sequence: String,
+    pub source_instance_id: String,
+    pub continuity_epoch: String,
+    pub slot: String,
+    pub signature: String,
+    pub receive_sequence: String,
+    pub received_at_unix_ns: String,
+    /// This is arrival provenance only. It is never an authoritative block
+    /// transaction index and is intentionally excluded from reconciliation.
+    pub observed_arrival_index: Option<String>,
+    pub source_frame_sha256: String,
+    pub continuity_status: String,
+    pub previous_record_sha256: String,
+    pub record_sha256: String,
+}
+
+impl FilteredIdentity {
+    pub fn seal(mut self, previous: String) -> Result<Self> {
+        self.schema = FILTERED_IDENTITY_SCHEMA.to_owned();
+        self.previous_record_sha256 = previous;
+        self.record_sha256 = hash_excluding_field(&self, "recordSha256")?;
+        Ok(self)
+    }
+
+    pub fn validate(&self, expected_manifest_sequence: u64, previous: &str) -> Result<()> {
+        if self.schema != FILTERED_IDENTITY_SCHEMA { bail!("FILTERED_IDENTITY_SCHEMA_INVALID") }
+        if self.manifest_sequence.parse::<u64>()? != expected_manifest_sequence { bail!("FILTERED_IDENTITY_MANIFEST_SEQUENCE_GAP") }
+        if self.receive_sequence.parse::<u64>().is_err() || self.slot.parse::<u64>().is_err() || self.received_at_unix_ns.parse::<u128>().is_err() {
+            bail!("FILTERED_IDENTITY_PROVENANCE_INVALID")
+        }
+        if self.source_instance_id.is_empty() || self.continuity_epoch.is_empty() || self.signature.is_empty() || self.source_frame_sha256.is_empty() {
+            bail!("FILTERED_IDENTITY_REQUIRED_FIELD_MISSING")
+        }
+        if self.continuity_status != "CONTINUOUS" { bail!("FILTERED_IDENTITY_CONTINUITY_NOT_CLEAN") }
+        if self.previous_record_sha256 != previous { bail!("FILTERED_IDENTITY_HASH_CHAIN_BREAK") }
+        if self.record_sha256 != hash_excluding_field(self, "recordSha256")? { bail!("FILTERED_IDENTITY_HASH_INVALID") }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StoragePolicy {
+    pub manifest_quota_bytes: u64,
+    pub protected_free_bytes: u64,
+    pub available_free_bytes: u64,
+    /// The manifest keeps only an identity de-duplication index in memory.
+    /// This hard cap makes the memory bound independent of the byte quota.
+    pub max_in_memory_identities: usize,
+}
+
+impl StoragePolicy {
+    fn permit(&self, existing: u64, next: u64) -> Result<()> {
+        if self.available_free_bytes <= self.protected_free_bytes { bail!("MANIFEST_PROTECTED_FREE_SPACE_RESERVE") }
+        if existing.checked_add(next).context("manifest size overflow")? > self.manifest_quota_bytes { bail!("MANIFEST_OUTPUT_QUOTA_REACHED") }
+        Ok(())
+    }
+
+    fn permit_identity_count(&self, existing: usize) -> Result<()> {
+        if existing >= self.max_in_memory_identities {
+            bail!("MANIFEST_MEMORY_CAP_REACHED")
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestCheckpoint {
+    pub schema: String,
+    pub epoch_id: String,
+    pub source_instance_id: String,
+    pub continuity_epoch: String,
+    pub next_manifest_sequence: String,
+    pub next_receive_sequence: String,
+    pub tail_record_sha256: String,
+    pub checkpoint_sha256: String,
+}
+
+impl ManifestCheckpoint {
+    fn seal(mut self) -> Result<Self> {
+        self.checkpoint_sha256 = hash_excluding_field(&self, "checkpointSha256")?;
+        Ok(self)
+    }
+    fn validate(&self) -> Result<()> {
+        if self.schema != FILTERED_IDENTITY_CHECKPOINT_SCHEMA || self.checkpoint_sha256 != hash_excluding_field(self, "checkpointSha256")? {
+            bail!("FILTERED_IDENTITY_CHECKPOINT_INVALID")
+        }
+        Ok(())
+    }
+}
+
+pub struct FilteredIdentityManifestWriter {
+    path: PathBuf,
+    checkpoint_path: PathBuf,
+    epoch_id: String,
+    source_instance_id: String,
+    continuity_epoch: String,
+    next_manifest_sequence: u64,
+    next_receive_sequence: u64,
+    tail: String,
+    bytes_written: u64,
+    identities: BTreeSet<(String, String)>,
+    policy: StoragePolicy,
+}
+
+impl FilteredIdentityManifestWriter {
+    pub fn open(root: &Path, epoch_id: &str, source_instance_id: &str, continuity_epoch: &str, first_manifest_sequence: u64, first_receive_sequence: u64, policy: StoragePolicy) -> Result<Self> {
+        if epoch_id.is_empty() || source_instance_id.is_empty() || continuity_epoch.is_empty() { bail!("MANIFEST_BINDING_MISSING") }
+        fs::create_dir_all(root)?;
+        let path = root.join(format!("{epoch_id}.filtered-identities.jsonl"));
+        let checkpoint_path = root.join(format!("{epoch_id}.filtered-identities.checkpoint.json"));
+        let mut next_manifest_sequence = first_manifest_sequence;
+        let mut next_receive_sequence = first_receive_sequence;
+        let mut tail = String::new();
+        let mut identities = BTreeSet::new();
+        if path.exists() {
+            for line in BufReader::new(File::open(&path)?).lines() {
+                let record: FilteredIdentity = serde_json::from_str(&line?)?;
+                record.validate(next_manifest_sequence, &tail)?;
+                if record.source_instance_id != source_instance_id || record.continuity_epoch != continuity_epoch { bail!("MANIFEST_EPOCH_OR_SOURCE_CONFLICT") }
+                if record.receive_sequence.parse::<u64>()? != next_receive_sequence { bail!("MANIFEST_RECEIVE_SEQUENCE_GAP") }
+                policy.permit_identity_count(identities.len())?;
+                if !identities.insert((record.slot.clone(), record.signature.clone())) { bail!("MANIFEST_DUPLICATE_IDENTITY") }
+                tail = record.record_sha256;
+                next_manifest_sequence += 1;
+                next_receive_sequence += 1;
+            }
+        }
+        if checkpoint_path.exists() {
+            let checkpoint: ManifestCheckpoint = serde_json::from_slice(&fs::read(&checkpoint_path)?)?;
+            checkpoint.validate()?;
+            if checkpoint.epoch_id != epoch_id || checkpoint.source_instance_id != source_instance_id || checkpoint.continuity_epoch != continuity_epoch || checkpoint.next_manifest_sequence.parse::<u64>()? != next_manifest_sequence || checkpoint.next_receive_sequence.parse::<u64>()? != next_receive_sequence || checkpoint.tail_record_sha256 != tail {
+                bail!("MANIFEST_CHECKPOINT_RECOVERY_CONFLICT")
+            }
+        }
+        let bytes_written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(Self { path, checkpoint_path, epoch_id: epoch_id.to_owned(), source_instance_id: source_instance_id.to_owned(), continuity_epoch: continuity_epoch.to_owned(), next_manifest_sequence, next_receive_sequence, tail, bytes_written, identities, policy })
+    }
+
+    pub fn append(&mut self, slot: u64, signature: &str, received_at_unix_ns: u128, observed_arrival_index: Option<u64>, source_frame_sha256: &str) -> Result<FilteredIdentity> {
+        if signature.is_empty() || source_frame_sha256.is_empty() { bail!("MANIFEST_INPUT_INVALID") }
+        let identity = (slot.to_string(), signature.to_owned());
+        if self.identities.contains(&identity) { bail!("MANIFEST_DUPLICATE_IDENTITY") }
+        self.policy.permit_identity_count(self.identities.len())?;
+        self.identities.insert(identity.clone());
+        let candidate = FilteredIdentity { schema: String::new(), manifest_sequence: self.next_manifest_sequence.to_string(), source_instance_id: self.source_instance_id.clone(), continuity_epoch: self.continuity_epoch.clone(), slot: slot.to_string(), signature: signature.to_owned(), receive_sequence: self.next_receive_sequence.to_string(), received_at_unix_ns: received_at_unix_ns.to_string(), observed_arrival_index: observed_arrival_index.map(|value| value.to_string()), source_frame_sha256: source_frame_sha256.to_owned(), continuity_status: "CONTINUOUS".to_owned(), previous_record_sha256: String::new(), record_sha256: String::new() }.seal(self.tail.clone())?;
+        let mut bytes = jcs_bytes(&serde_json::to_value(&candidate)?)?;
+        bytes.push(b'\n');
+        if let Err(error) = self.policy.permit(self.bytes_written, bytes.len() as u64) {
+            self.identities.remove(&identity);
+            return Err(error);
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+        self.bytes_written += bytes.len() as u64;
+        self.tail = candidate.record_sha256.clone();
+        self.next_manifest_sequence += 1;
+        self.next_receive_sequence += 1;
+        self.persist_checkpoint()?;
+        Ok(candidate)
+    }
+
+    fn persist_checkpoint(&self) -> Result<()> {
+        let checkpoint = ManifestCheckpoint { schema: FILTERED_IDENTITY_CHECKPOINT_SCHEMA.to_owned(), epoch_id: self.epoch_id.clone(), source_instance_id: self.source_instance_id.clone(), continuity_epoch: self.continuity_epoch.clone(), next_manifest_sequence: self.next_manifest_sequence.to_string(), next_receive_sequence: self.next_receive_sequence.to_string(), tail_record_sha256: self.tail.clone(), checkpoint_sha256: String::new() }.seal()?;
+        let temporary = self.checkpoint_path.with_extension("tmp");
+        fs::write(&temporary, jcs_bytes(&serde_json::to_value(&checkpoint)?)?)?;
+        fs::rename(temporary, &self.checkpoint_path)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalizedTransactionInput {
+    pub transaction_index: String,
+    pub signature: String,
+    /// The actual account keys and invoked program IDs of this finalized
+    /// transaction. No relevance decision may use the signature itself.
+    pub account_or_program_ids: Vec<String>,
+    pub supported_version: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalizedBlockInput {
+    pub slot: String,
+    pub block_identity: String,
+    pub finalized: bool,
+    pub executed_transaction_count: String,
+    pub transactions: Vec<FinalizedTransactionInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationReceipt {
+    pub schema: String,
+    pub epoch_id: String,
+    pub source_instance_id: String,
+    pub continuity_epoch: String,
+    pub slot: String,
+    pub block_identity: String,
+    pub manifest_identity_count: String,
+    pub block_relevant_identity_count: String,
+    pub disposition: String,
+    pub reason_code: Option<String>,
+    pub receipt_sha256: String,
+}
+
+impl ReconciliationReceipt {
+    fn seal(mut self) -> Result<Self> { self.receipt_sha256 = hash_excluding_field(&self, "receiptSha256")?; Ok(self) }
+}
+
+/// A slot may receive at most one finalized identity.  A different identity
+/// for the same slot is a fork/provider conflict and closes the interval.
+#[derive(Default)]
+pub struct FinalizedBlockRegistry { identities: BTreeMap<String, String> }
+
+impl FinalizedBlockRegistry {
+    pub fn insert(&mut self, block: &FinalizedBlockInput) -> Result<()> {
+        if !block.finalized || block.slot.is_empty() || block.block_identity.is_empty() { bail!("FINALIZED_BLOCK_PROOF_INVALID") }
+        if self.identities.len() >= MAX_PENDING_SLOTS && !self.identities.contains_key(&block.slot) { bail!("FINALIZED_BLOCK_REGISTRY_CAPACITY") }
+        if let Some(existing) = self.identities.get(&block.slot) {
+            if existing != &block.block_identity { bail!("FINALIZED_BLOCK_FORK_CONFLICT") }
+            return Ok(())
+        }
+        self.identities.insert(block.slot.clone(), block.block_identity.clone());
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IntervalCompleteness {
+    pub epoch_id: String,
+    pub source_instance_id: String,
+    pub continuity_epoch: String,
+    pub first_capture_slot: String,
+    pub first_capture_slot_reconciled: bool,
+    pub source_restart_or_gap_observed: bool,
+    pub block_receipts: Vec<ReconciliationReceipt>,
+}
+
+impl IntervalCompleteness {
+    /// There is no time-based warm-up. The interval starts at its first
+    /// explicitly reconciled finalized slot and stays complete only while one
+    /// source instance/epoch remains continuous and every collected proof slot
+    /// matched exactly. Slots absent from a provider result are failures, not
+    /// gaps that a later slot can silently cover.
+    pub fn verify(&self) -> Result<()> {
+        if self.first_capture_slot.is_empty() || !self.first_capture_slot_reconciled { bail!("CAPTURE_START_NOT_RECONCILED") }
+        if self.source_restart_or_gap_observed { bail!("INTERVAL_CONTINUITY_BREAK") }
+        if self.block_receipts.is_empty() { bail!("INTERVAL_NO_BLOCK_PROOFS") }
+        let mut saw_start = false;
+        for receipt in &self.block_receipts {
+            if receipt.schema != FINALIZED_RECONCILIATION_SCHEMA || receipt.receipt_sha256 != hash_excluding_field(receipt, "receiptSha256")? { bail!("RECONCILIATION_RECEIPT_INVALID") }
+            if receipt.epoch_id != self.epoch_id || receipt.source_instance_id != self.source_instance_id || receipt.continuity_epoch != self.continuity_epoch { bail!("INTERVAL_EPOCH_BINDING_MISMATCH") }
+            if receipt.disposition != "MATCHED" || receipt.reason_code.is_some() { bail!("INTERVAL_RECONCILIATION_NOT_COMPLETE") }
+            if receipt.slot == self.first_capture_slot { saw_start = true; }
+        }
+        if !saw_start { bail!("CAPTURE_START_PROOF_MISSING") }
+        Ok(())
+    }
+}
+
+fn validate_manifest_chain(manifest: &[FilteredIdentity], source_instance_id: &str, continuity_epoch: &str) -> Result<()> {
+    let mut prior = String::new();
+    let mut expected_manifest_sequence = None;
+    let mut expected_receive_sequence = None;
+    for identity in manifest {
+        let manifest_sequence: u64 = identity.manifest_sequence.parse()?;
+        let receive_sequence: u64 = identity.receive_sequence.parse()?;
+        if let Some(expected) = expected_manifest_sequence {
+            if manifest_sequence != expected { bail!("MANIFEST_SEQUENCE_GAP") }
+        }
+        if let Some(expected) = expected_receive_sequence {
+            if receive_sequence != expected { bail!("MANIFEST_RECEIVE_SEQUENCE_GAP") }
+        }
+        identity.validate(manifest_sequence, &prior)?;
+        if identity.source_instance_id != source_instance_id || identity.continuity_epoch != continuity_epoch || identity.continuity_status != "CONTINUOUS" {
+            bail!("MANIFEST_CONTINUITY_OR_EPOCH_INVALID")
+        }
+        prior = identity.record_sha256.clone();
+        expected_manifest_sequence = Some(manifest_sequence.checked_add(1).context("manifest sequence overflow")?);
+        expected_receive_sequence = Some(receive_sequence.checked_add(1).context("receive sequence overflow")?);
+    }
+    Ok(())
+}
+
+pub fn reconcile_finalized_block(epoch_id: &str, source_instance_id: &str, continuity_epoch: &str, block: FinalizedBlockInput, manifest: &[FilteredIdentity], canonical_program_ids: &BTreeSet<String>) -> Result<ReconciliationReceipt> {
+    if !block.finalized { bail!("BLOCK_NOT_FINALIZED") }
+    let expected: usize = block.executed_transaction_count.parse().context("BLOCK_COUNT_INVALID")?;
+    if block.transactions.len() != expected { bail!("BLOCK_INVENTORY_INCOMPLETE") }
+    if block.transactions.len() > MAX_IDENTITIES_PER_SLOT { bail!("BLOCK_RECONCILIATION_MEMORY_CAP") }
+    let mut seen_indexes = BTreeSet::new(); let mut seen_signatures = BTreeSet::new(); let mut block_relevant = BTreeSet::new();
+    for transaction in block.transactions {
+        let index: usize = transaction.transaction_index.parse().context("BLOCK_TRANSACTION_INDEX_INVALID")?;
+        if index >= expected || !seen_indexes.insert(index) || !seen_signatures.insert(transaction.signature.clone()) { bail!("BLOCK_ORDER_OR_IDENTITY_CONFLICT") }
+        if !transaction.supported_version { bail!("UNSUPPORTED_TRANSACTION_VERSION") }
+        if transaction.account_or_program_ids.iter().any(|id| canonical_program_ids.contains(id)) {
+            block_relevant.insert((block.slot.clone(), transaction.signature));
+        }
+    }
+    if seen_indexes.len() != expected { bail!("BLOCK_INDEX_INVENTORY_INCOMPLETE") }
+    validate_manifest_chain(manifest, source_instance_id, continuity_epoch)?;
+    let mut observed = BTreeSet::new();
+    for identity in manifest.iter().filter(|identity| identity.slot == block.slot) {
+        if !observed.insert((identity.slot.clone(), identity.signature.clone())) { bail!("MANIFEST_DUPLICATE_IDENTITY") }
+    }
+    if observed.len() > MAX_IDENTITIES_PER_SLOT { bail!("MANIFEST_RECONCILIATION_MEMORY_CAP") }
+    let (disposition, reason_code) = if observed == block_relevant { ("MATCHED", None) } else if observed.is_subset(&block_relevant) { ("REJECTED", Some("MISSING_FILTERED_IDENTITY".to_owned())) } else if block_relevant.is_subset(&observed) { ("REJECTED", Some("EXTRA_FILTERED_IDENTITY".to_owned())) } else { ("REJECTED", Some("FILTERED_IDENTITY_SET_CONFLICT".to_owned())) };
+    Ok(ReconciliationReceipt { schema: FINALIZED_RECONCILIATION_SCHEMA.to_owned(), epoch_id: epoch_id.to_owned(), source_instance_id: source_instance_id.to_owned(), continuity_epoch: continuity_epoch.to_owned(), slot: block.slot, block_identity: block.block_identity, manifest_identity_count: observed.len().to_string(), block_relevant_identity_count: block_relevant.len().to_string(), disposition: disposition.to_owned(), reason_code, receipt_sha256: String::new() }.seal()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn policy() -> StoragePolicy { StoragePolicy { manifest_quota_bytes: 64 * 1024, protected_free_bytes: 100, available_free_bytes: 100_000, max_in_memory_identities: 1_024 } }
+    fn writer(root: &Path) -> FilteredIdentityManifestWriter { FilteredIdentityManifestWriter::open(root, "epoch-a", "source-a", "7", 0, 0, policy()).unwrap() }
+    fn block(slot: u64, relevant: &[&str]) -> FinalizedBlockInput {
+        let ids = ["pump", "router", "swap"];
+        let mut transactions = Vec::new();
+        for index in 0..4 {
+            let signature = format!("sig-{slot}-{index}");
+            transactions.push(FinalizedTransactionInput { transaction_index: index.to_string(), signature: signature.clone(), account_or_program_ids: if relevant.contains(&signature.as_str()) { vec![ids[0].to_owned()] } else { vec!["other".to_owned()] }, supported_version: true });
+        }
+        FinalizedBlockInput { slot: slot.to_string(), block_identity: format!("block-{slot}"), finalized: true, executed_transaction_count: "4".into(), transactions }
+    }
+    fn programs() -> BTreeSet<String> { ["pump".to_owned(), "router".to_owned(), "swap".to_owned()].into_iter().collect() }
+    fn all_records(root: &Path) -> Vec<FilteredIdentity> { BufReader::new(File::open(root.join("epoch-a.filtered-identities.jsonl")).unwrap()).lines().map(|line| serde_json::from_str(&line.unwrap()).unwrap()).collect() }
+
+    #[test]
+    fn complete_interval_reconciles_and_reversed_arrivals_are_not_order() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-2", 30, Some(999), "raw-2").unwrap();
+        out.append(10, "sig-10-0", 31, Some(2), "raw-0").unwrap();
+        let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0", "sig-10-2"]), &all_records(root.path()), &programs()).unwrap();
+        assert_eq!(receipt.disposition, "MATCHED");
+    }
+
+    #[test]
+    fn missing_extra_and_duplicate_identities_fail_closed() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        let missing = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0", "sig-10-2"]), &all_records(root.path()), &programs()).unwrap();
+        assert_eq!(missing.reason_code.as_deref(), Some("MISSING_FILTERED_IDENTITY"));
+        assert!(out.append(10, "sig-10-0", 2, None, "raw").unwrap_err().to_string().contains("DUPLICATE"));
+        let extra = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &[]), &all_records(root.path()), &programs()).unwrap();
+        assert_eq!(extra.reason_code.as_deref(), Some("EXTRA_FILTERED_IDENTITY"));
+    }
+
+    #[test]
+    fn gaps_forks_versions_and_capture_storage_fail_closed() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        let mut bad = block(10, &["sig-10-0"]); bad.transactions[1].transaction_index = "0".into();
+        assert!(reconcile_finalized_block("epoch-a", "source-a", "7", bad, &all_records(root.path()), &programs()).is_err());
+        let mut unsupported = block(10, &["sig-10-0"]); unsupported.transactions[0].supported_version = false;
+        assert!(reconcile_finalized_block("epoch-a", "source-a", "7", unsupported, &all_records(root.path()), &programs()).unwrap_err().to_string().contains("UNSUPPORTED"));
+        let tiny = StoragePolicy { manifest_quota_bytes: 1, protected_free_bytes: 100, available_free_bytes: 100_000, max_in_memory_identities: 1_024 };
+        let mut tiny_writer = FilteredIdentityManifestWriter::open(root.path(), "tiny", "source-a", "7", 0, 0, tiny).unwrap();
+        assert!(tiny_writer.append(1, "x", 1, None, "raw").unwrap_err().to_string().contains("QUOTA"));
+
+        let memory_limited = StoragePolicy { manifest_quota_bytes: 64 * 1024, protected_free_bytes: 100, available_free_bytes: 100_000, max_in_memory_identities: 1 };
+        let mut memory_writer = FilteredIdentityManifestWriter::open(root.path(), "memory", "source-a", "7", 0, 0, memory_limited).unwrap();
+        memory_writer.append(1, "first", 1, None, "raw").unwrap();
+        assert!(memory_writer.append(2, "second", 2, None, "raw").unwrap_err().to_string().contains("MEMORY_CAP"));
+    }
+
+    #[test]
+    fn restart_recovers_and_corruption_or_epoch_change_rejects() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw-a").unwrap(); drop(out);
+        let mut resumed = writer(root.path()); resumed.append(10, "sig-10-2", 2, None, "raw-b").unwrap();
+        assert_eq!(all_records(root.path()).len(), 2);
+        assert!(FilteredIdentityManifestWriter::open(root.path(), "epoch-a", "source-b", "7", 0, 0, policy()).is_err());
+        let path = root.path().join("epoch-a.filtered-identities.jsonl"); fs::write(&path, b"corrupt\n").unwrap();
+        assert!(FilteredIdentityManifestWriter::open(root.path(), "epoch-a", "source-a", "7", 0, 0, policy()).is_err());
+    }
+
+    #[test]
+    fn interval_proof_requires_reconciled_start_and_unbroken_epoch() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
+        let complete = IntervalCompleteness { epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(), first_capture_slot: "10".into(), first_capture_slot_reconciled: true, source_restart_or_gap_observed: false, block_receipts: vec![receipt.clone()] };
+        complete.verify().unwrap();
+        let broken = IntervalCompleteness { source_restart_or_gap_observed: true, ..complete.clone() };
+        assert!(broken.verify().unwrap_err().to_string().contains("CONTINUITY"));
+        let no_start = IntervalCompleteness { first_capture_slot_reconciled: false, ..complete };
+        assert!(no_start.verify().unwrap_err().to_string().contains("CAPTURE_START"));
+    }
+
+    #[test]
+    fn block_registry_and_rpc_budget_fail_closed() {
+        let mut registry = FinalizedBlockRegistry::default();
+        let known = block(10, &[]); registry.insert(&known).unwrap(); registry.insert(&known).unwrap();
+        let mut fork = known.clone(); fork.block_identity = "different".into();
+        assert!(registry.insert(&fork).unwrap_err().to_string().contains("FORK"));
+        let mut budget = RpcBudget::new(2, 1, 100).unwrap(); budget.consume_one().unwrap(); budget.consume_one().unwrap();
+        assert_eq!(budget.used_requests(), 2); assert!(budget.consume_one().unwrap_err().to_string().contains("BUDGET"));
+        assert!(RpcBudget::new(1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn malformed_manifest_gap_blocks_reconciliation() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw-a").unwrap();
+        out.append(10, "sig-10-2", 2, None, "raw-b").unwrap();
+        let mut records = all_records(root.path()); records[1].receive_sequence = "9".into();
+        assert!(reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0", "sig-10-2"]), &records, &programs()).unwrap_err().to_string().contains("RECEIVE_SEQUENCE"));
+    }
+
+    #[test]
+    fn unavailable_or_nonfinalized_block_cannot_close_an_interval() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        let mut unfinalized = block(10, &["sig-10-0"]); unfinalized.finalized = false;
+        assert!(reconcile_finalized_block("epoch-a", "source-a", "7", unfinalized, &all_records(root.path()), &programs()).unwrap_err().to_string().contains("NOT_FINALIZED"));
+    }
+}
