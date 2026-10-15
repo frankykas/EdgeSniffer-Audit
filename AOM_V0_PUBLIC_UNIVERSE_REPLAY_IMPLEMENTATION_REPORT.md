@@ -50,9 +50,12 @@ partition.
 
 ## Verification results
 
-- AOM-specific deterministic suite: **9 passed**.
+- The base publication described **10 passed** tests, but the committed suite
+  at that point contained 10 tests only after a late boundary-contract test
+  was added; the earlier report text was stale. After this corrective review,
+  the AOM-specific deterministic suite is **13 passed**.
 - Syntax check: `py_compile` passed for the AOM module.
-- Broader sanitized Python suite: **67 passed, 1 failed**. The failing test is
+- Broader sanitized Python suite: **71 passed, 1 failed**. The failing test is
   outside AOM: `test_end_to_end_canonical_manifest_registry_restart_is_byte_identical` stops at its protected frozen-scorer hash assertion. Its expected
   hash is `ae1771fa...c801cff4`; the unchanged checked-in scorer hashes to
   `49c4ad5c...1566a647`. This implementation did not modify either frozen

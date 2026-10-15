@@ -24,6 +24,8 @@ from typing import Any, Iterable
 
 INPUT_SCHEMA = "AOM_V0_PUBLIC_INPUT_CONTRACT_V1"
 PARTITION_SCHEMA = "AOM_V0_PARTITION_ADMISSION_V1"
+PROOF_BUNDLE_SCHEMA = "AOM_V0_IMMUTABLE_PROOF_BUNDLE_V1"
+PROOF_SCHEMA = "AOM_V0_IMMUTABLE_PROOF_V1"
 DECISION_BOUNDARY_SCHEMA = "AOM_V0_PUBLIC_DECISION_BOUNDARY_V1"
 EXECUTION_SCHEMA = "AOM_V0_EXECUTION_ASSUMPTIONS_V1"
 OUTPUT_SCHEMA = "AOM_V0_PUBLIC_REPLAY_OUTPUT_V1"
@@ -59,6 +61,12 @@ def canonical_bytes(value: Any) -> bytes:
 
 def sha256(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def hash_without(value: dict[str, Any], field: str) -> str:
+    if field not in value:
+        raise AdmissionBlocked("MISSING_HASH_FIELD:" + field)
+    return sha256({key: item for key, item in value.items() if key != field})
 
 
 def require_keys(row: dict[str, Any], keys: Iterable[str], reason: str) -> None:
@@ -106,18 +114,41 @@ def validate_input_contract(row: dict[str, Any]) -> None:
         raise AdmissionBlocked("PROHIBITED_NONPUBLIC_FIELD:" + ",".join(present))
     event_identity(row); public_event_time(row)
     require_keys(row, ("pool", "mint", "quote_mint", "pool_base_pre_raw", "pool_quote_pre_raw",
-                       "amm_fee_bps", "side", "quote_amount_raw", "pool_identity_proof_ref",
+                       "amm_fee_bps", "fee_model", "fee_denomination", "side", "quote_amount_raw", "pool_identity_proof_ref",
                        "causal_proof_ref", "feature_validity"), "MISSING_PUBLIC_STATE")
     if not str(row["pool"]) or not str(row["mint"]) or int(row["pool_base_pre_raw"]) <= 0 or int(row["pool_quote_pre_raw"]) <= 0:
         raise AdmissionBlocked("INVALID_PUBLIC_POOL_STATE")
     if int(row["amm_fee_bps"]) < 0 or int(row["amm_fee_bps"]) >= 10_000:
         raise AdmissionBlocked("INVALID_FEE")
+    if row["fee_model"] != "INPUT_AMOUNT_BPS" or row["fee_denomination"] != "INPUT_TOKEN":
+        raise AdmissionBlocked("UNSUPPORTED_FEE_DENOMINATION")
     if not isinstance(row["feature_validity"], dict):
         raise AdmissionBlocked("INVALID_FEATURE_VALIDITY")
 
 
-def validate_partition_admission(proof: dict[str, Any]) -> dict[str, Any]:
-    """Validate independent capture and universe claims; neither substitutes for the other."""
+def _proof_by_id(bundle: dict[str, Any], proof_id: str, expected_kind: str, partition: dict[str, Any]) -> dict[str, Any]:
+    if bundle.get("schema") != PROOF_BUNDLE_SCHEMA:
+        raise AdmissionBlocked("PROOF_BUNDLE_SCHEMA_MISMATCH")
+    if bundle.get("bundle_sha256") != hash_without(bundle, "bundle_sha256"):
+        raise AdmissionBlocked("PROOF_BUNDLE_HASH_MISMATCH")
+    matches = [item for item in bundle.get("proofs", []) if item.get("proof_id") == proof_id]
+    if len(matches) != 1:
+        raise AdmissionBlocked("PROOF_REFERENCE_UNRESOLVED:" + proof_id)
+    proof = matches[0]
+    if proof.get("schema") != PROOF_SCHEMA or proof.get("kind") != expected_kind:
+        raise AdmissionBlocked("PROOF_KIND_MISMATCH:" + proof_id)
+    if proof.get("proof_sha256") != hash_without(proof, "proof_sha256"):
+        raise AdmissionBlocked("PROOF_HASH_MISMATCH:" + proof_id)
+    if proof.get("partition_id") != partition["partition_id"] or proof.get("partition_manifest_sha256") != partition["manifest_sha256"]:
+        raise AdmissionBlocked("PROOF_PARTITION_BINDING_MISMATCH:" + proof_id)
+    payload = proof.get("payload")
+    if not isinstance(payload, dict) or proof.get("payload_sha256") != sha256(payload):
+        raise AdmissionBlocked("PROOF_PAYLOAD_HASH_MISMATCH:" + proof_id)
+    return proof
+
+
+def validate_partition_admission(proof: dict[str, Any], proof_bundle: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Verify immutable evidence; booleans and reference strings are never sufficient."""
     if proof.get("schema") != PARTITION_SCHEMA:
         raise AdmissionBlocked("PARTITION_SCHEMA_MISMATCH")
     require_keys(proof, ("partition_id", "capture_start_unix_ns", "capture_end_unix_ns",
@@ -139,13 +170,26 @@ def validate_partition_admission(proof: dict[str, Any]) -> dict[str, Any]:
     for field in ("transaction_coverage_proof_ref", "causal_order_proof_ref", "universe_proof_ref", "manifest_sha256"):
         if not isinstance(proof[field], str) or not proof[field]:
             raise AdmissionBlocked("MISSING_IMMUTABLE_PROOF_REF:" + field)
+    if proof_bundle is None:
+        raise AdmissionBlocked("IMMUTABLE_PROOF_BUNDLE_REQUIRED")
+    coverage = _proof_by_id(proof_bundle, proof["transaction_coverage_proof_ref"], "FINALIZED_TRANSACTION_COVERAGE", proof)
+    order = _proof_by_id(proof_bundle, proof["causal_order_proof_ref"], "CANONICAL_CAUSAL_ORDER", proof)
+    universe = _proof_by_id(proof_bundle, proof["universe_proof_ref"], "COMPLETE_ELIGIBLE_POOL_UNIVERSE", proof)
+    if coverage["payload"].get("finalized_block_inventory_complete") is not True or coverage["payload"].get("filtered_identity_reconciled") is not True or not coverage["payload"].get("relevant_identity_manifest_sha256") or not coverage["payload"].get("block_proof_manifest_sha256"):
+        raise AdmissionBlocked("TRANSACTION_COVERAGE_PROOF_INSUFFICIENT")
+    if order["payload"].get("all_state_events_order_resolved") is not True or order["payload"].get("ambiguous_event_count") != 0 or not order["payload"].get("causal_event_set_sha256"):
+        raise AdmissionBlocked("CAUSAL_ORDER_PROOF_INSUFFICIENT")
+    required_universe = ("universe_complete", "candidate_registry_sha256", "potential_pool_inventory_sha256", "recovery_status_sha256")
+    if universe["payload"].get("universe_complete") is not True or any(not universe["payload"].get(field) for field in required_universe[1:]) or universe["payload"].get("unresolved_pool_count") != 0 or universe["payload"].get("source_instance_id") != proof["source_instance_id"] or universe["payload"].get("continuity_epoch") != proof["continuity_epoch"]:
+        raise AdmissionBlocked("UNIVERSE_PROOF_INSUFFICIENT")
     return {"partition_id": str(proof["partition_id"]), "admitted": True,
-            "admission_hash": sha256(proof)}
+            "admission_hash": sha256({"partition": proof, "coverage": coverage["proof_sha256"],
+                                        "order": order["proof_sha256"], "universe": universe["proof_sha256"]})}
 
 
-def validate_decision_boundary(boundary: dict[str, Any], partition_proof: dict[str, Any]) -> dict[str, Any]:
+def validate_decision_boundary(boundary: dict[str, Any], partition_proof: dict[str, Any], proof_bundle: dict[str, Any] | None = None) -> dict[str, Any]:
     """Bind a public decision clock to one independently admitted partition."""
-    admission = validate_partition_admission(partition_proof)
+    admission = validate_partition_admission(partition_proof, proof_bundle)
     if boundary.get("schema") != DECISION_BOUNDARY_SCHEMA:
         raise AdmissionBlocked("DECISION_BOUNDARY_SCHEMA_MISMATCH")
     require_keys(boundary, ("decision_boundary_id", "partition_id", "decision_at_unix_ns",
@@ -163,16 +207,21 @@ def validate_decision_boundary(boundary: dict[str, Any], partition_proof: dict[s
     for field in ("state_proof_ref", "coverage_proof_ref", "universe_proof_ref"):
         if not isinstance(boundary[field], str) or not boundary[field]:
             raise AdmissionBlocked("MISSING_DECISION_BOUNDARY_PROOF:" + field)
+    if boundary["coverage_proof_ref"] != partition_proof["transaction_coverage_proof_ref"] or boundary["universe_proof_ref"] != partition_proof["universe_proof_ref"]:
+        raise AdmissionBlocked("DECISION_BOUNDARY_PROOF_BINDING_MISMATCH")
+    state = _proof_by_id(proof_bundle or {}, boundary["state_proof_ref"], "PREDECISION_PUBLIC_STATE", partition_proof)
+    if state["payload"].get("state_complete") is not True or state["payload"].get("state_at_unix_ns") != boundary["decision_at_unix_ns"] or state["payload"].get("causal_checkpoint") != boundary["causal_checkpoint"]:
+        raise AdmissionBlocked("DECISION_STATE_PROOF_INSUFFICIENT")
     return {"decision_boundary_id": str(boundary["decision_boundary_id"]), "boundary_hash": sha256(boundary), **admission}
 
 
-def inventory_partition_proofs(proofs: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
+def inventory_partition_proofs(proofs: Iterable[dict[str, Any]], proof_bundles: dict[str, dict[str, Any]] | None = None) -> list[dict[str, str]]:
     """Read-only inventory: returns one admission result per supplied manifest."""
     results = []
     for proof in proofs:
         partition = str(proof.get("partition_id", "UNKNOWN"))
         try:
-            result = validate_partition_admission(proof)
+            result = validate_partition_admission(proof, (proof_bundles or {}).get(partition))
             results.append({"partition_id": partition, "status": "ADMITTED", "reason": "", **result})
         except AdmissionBlocked as error:
             results.append({"partition_id": partition, "status": "BLOCKED", "reason": str(error)})
@@ -195,12 +244,19 @@ def public_f01_f13(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     # unprovable for this compact V0 engine, so it fails closed.
     ordered = sorted(rows, key=causal_key)
     seen_ids: set[tuple] = set(); first_seen: dict[str, int] = {}; buys: dict[str, deque[dict[str, Any]]] = defaultdict(deque)
+    ever_observed_buy: set[str] = set()
     last_buy_time: dict[str, int] = {}; last_quote: dict[str, int] = {}
     output: list[dict[str, Any]] = []
     prior_observed_at = -1
+    active_source_epoch: tuple[str, int] | None = None
     for row in ordered:
         validate_input_contract(row)
         identity = event_identity(row)
+        source_epoch = (identity[0], identity[1])
+        if active_source_epoch is None:
+            active_source_epoch = source_epoch
+        elif source_epoch != active_source_epoch:
+            raise AdmissionBlocked("CROSS_EPOCH_PUBLIC_FEATURE_INPUT")
         if identity in seen_ids:
             raise AdmissionBlocked("DUPLICATE_PUBLIC_EVENT")
         seen_ids.add(identity)
@@ -213,6 +269,7 @@ def public_f01_f13(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         is_buy = str(row["side"]).upper() == "BUY"
         valid = dict(row["feature_validity"])
         history_complete = all(valid.get(key) is True for key in ("state", "pool_age", "flow_5s", "flow_20s", "flow_60s"))
+        full_lifetime_history = valid.get("full_pool_history") is True
         pre_quote, pre_base = int(row["pool_quote_pre_raw"]), int(row["pool_base_pre_raw"])
         prior_quote = last_quote.get(pool)
         values = {
@@ -222,21 +279,30 @@ def public_f01_f13(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             "F04_observed_pool_age_seconds": (now_ns - first_seen[pool]) / 1_000_000_000,
             "F05_seconds_since_previous_observed_buy": None if pool not in last_buy_time else (now_ns - last_buy_time[pool]) / 1_000_000_000,
             "F06_prior_pre_pool_quote_log_change": None if prior_quote is None else math.log(pre_quote) - math.log(prior_quote),
-            "F13_no_prior_observed_buy": len(history) == 0,
+            # This is lifetime state, intentionally separate from the rolling
+            # 60-second deque used by F07-F12.
+            "F13_no_prior_observed_buy": (pool not in ever_observed_buy) if full_lifetime_history else None,
         }
         for window, count_name, amount_name in zip(WINDOWS_NS, FEATURE_NAMES[6:9], FEATURE_NAMES[9:12]):
             eligible = [item for item in history if public_event_time(item) >= now_ns - window]
             values[count_name] = len(eligible)
             values[amount_name] = sum(int(item["quote_amount_raw"]) for item in eligible)
         masks = {name: history_complete for name in FEATURE_NAMES}
-        masks["F05_seconds_since_previous_observed_buy"] = history_complete and pool in last_buy_time
-        masks["F06_prior_pre_pool_quote_log_change"] = history_complete and prior_quote is not None
+        masks["F04_observed_pool_age_seconds"] = history_complete and full_lifetime_history
+        masks["F05_seconds_since_previous_observed_buy"] = history_complete and full_lifetime_history
+        masks["F06_prior_pre_pool_quote_log_change"] = history_complete
+        masks["F13_no_prior_observed_buy"] = full_lifetime_history
         output.append({"event_identity": identity, "pool": pool, "mint": str(row["mint"]),
                        "decision_at_unix_ns": now_ns, "feature_values": values,
-                       "feature_validity": masks, "source_row_hash": sha256(row)})
+                       "feature_validity": masks,
+                       "feature_missingness": {
+                           "F05_seconds_since_previous_observed_buy": "NO_PRIOR_OBSERVED_BUY" if pool not in last_buy_time else "",
+                           "F06_prior_pre_pool_quote_log_change": "NO_PRIOR_OBSERVED_STATE" if prior_quote is None else "",
+                           "F13_no_prior_observed_buy": "LIFETIME_HISTORY_UNPROVEN" if not full_lifetime_history else "",
+                       }, "source_row_hash": sha256(row)})
         last_quote[pool] = pre_quote
         if is_buy:
-            history.append(row); last_buy_time[pool] = now_ns
+            history.append(row); last_buy_time[pool] = now_ns; ever_observed_buy.add(pool)
     return output
 
 
@@ -271,7 +337,7 @@ class ExecutionAssumptions:
     entry_notional_quote_raw: int
     network_fee_quote_raw: int
     priority_fee_quote_raw: int
-    failed_transaction_cost_quote_raw: int
+    failed_attempt_cost_quote_raw: int
     entry_latency_ns: int
     exit_latency_ns: int
     cost_evidence_ref: str
@@ -281,7 +347,7 @@ class ExecutionAssumptions:
         if self.schema != EXECUTION_SCHEMA or not self.cost_evidence_ref:
             raise AdmissionBlocked("MISSING_EXECUTION_COST_PROOF")
         if min(self.entry_notional_quote_raw, self.network_fee_quote_raw, self.priority_fee_quote_raw,
-               self.failed_transaction_cost_quote_raw, self.entry_latency_ns, self.exit_latency_ns) < 0:
+               self.failed_attempt_cost_quote_raw, self.entry_latency_ns, self.exit_latency_ns) < 0:
             raise AdmissionBlocked("INVALID_EXECUTION_ASSUMPTION")
         if self.entry_notional_quote_raw <= 0:
             raise AdmissionBlocked("NONPOSITIVE_ENTRY_NOTIONAL")
@@ -301,36 +367,67 @@ def _constant_product_exact_input(base: int, quote: int, input_amount: int, fee_
     raise AdmissionBlocked("UNSUPPORTED_TRANSITION_DIRECTION")
 
 
+def _validate_execution_fee(row: dict[str, Any]) -> None:
+    if row.get("fee_model") != "INPUT_AMOUNT_BPS" or row.get("fee_denomination") != "INPUT_TOKEN":
+        raise AdmissionBlocked("UNSUPPORTED_EXECUTION_FEE_DENOMINATION")
+
+
 def simulate_exact_supported_transition(entry: dict[str, Any], exit_mark: dict[str, Any] | None,
                                         assumptions: ExecutionAssumptions) -> dict[str, Any]:
-    """Bounded cash-flow ledger; AMM fees are embedded in exact swap output once."""
+    """Bounded cash-flow ledger with explicit fill/attempt/open-position state.
+
+    AMM fees are embedded in exact swap output once.  A failed-attempt charge
+    needs a concrete failed attempt and evidence reference; unavailable quotes
+    and missing marks never invent a transaction cost or discard an open base
+    position.
+    """
     assumptions.validate()
     if entry.get("transition_model") != "CONSTANT_PRODUCT_EXACT_INPUT_V1" or entry.get("exact_transition_validated") is not True:
         raise AdmissionBlocked("UNSUPPORTED_OR_UNVALIDATED_TRANSITION")
-    if int(entry.get("entry_available_at_unix_ns", -1)) < int(entry.get("decision_at_unix_ns", 0)) + assumptions.entry_latency_ns:
-        return {"status": "NO_FILL", "reason": "ENTRY_LATENCY_UNMET", "net_quote_raw": -assumptions.failed_transaction_cost_quote_raw,
-                "cash_ledger": {"failed_transaction_cost": assumptions.failed_transaction_cost_quote_raw}}
+    _validate_execution_fee(entry)
+    entry_status = entry.get("entry_attempt_status", "NO_FILL")
+    if entry_status not in {"FILLED", "FAILED", "NO_FILL"}:
+        raise AdmissionBlocked("INVALID_ENTRY_ATTEMPT_STATUS")
+    if entry_status == "FAILED":
+        if not entry.get("entry_failure_evidence_ref"):
+            raise AdmissionBlocked("FAILED_ENTRY_EVIDENCE_REQUIRED")
+        return {"status": "ENTRY_FAILED", "reason": "ATTEMPT_FAILED", "realized_net_quote_raw": -assumptions.failed_attempt_cost_quote_raw,
+                "position_base_raw": 0, "cash_ledger": {"failed_attempt_cost": assumptions.failed_attempt_cost_quote_raw}}
+    if entry_status == "NO_FILL" or int(entry.get("entry_available_at_unix_ns", -1)) < int(entry.get("decision_at_unix_ns", 0)) + assumptions.entry_latency_ns:
+        return {"status": "ENTRY_NO_FILL", "reason": "ENTRY_LATENCY_UNMET" if entry_status != "NO_FILL" else str(entry.get("no_fill_reason", "NO_ENTRY_QUOTE")),
+                "realized_net_quote_raw": 0, "position_base_raw": 0, "cash_ledger": {}}
     base_out, entry_amm_fee = _constant_product_exact_input(int(entry["pool_base_pre_raw"]), int(entry["pool_quote_pre_raw"]),
                                                              assumptions.entry_notional_quote_raw, int(entry["amm_fee_bps"]), direction="BUY")
     if base_out <= 0:
-        return {"status": "NO_FILL", "reason": "ZERO_BASE_OUTPUT", "net_quote_raw": -assumptions.failed_transaction_cost_quote_raw,
-                "cash_ledger": {"failed_transaction_cost": assumptions.failed_transaction_cost_quote_raw}}
+        return {"status": "ENTRY_NO_FILL", "reason": "ZERO_BASE_OUTPUT", "realized_net_quote_raw": 0,
+                "position_base_raw": 0, "cash_ledger": {}}
+    entry_cost = assumptions.network_fee_quote_raw + assumptions.priority_fee_quote_raw
+    base_ledger = {"entry_notional": assumptions.entry_notional_quote_raw, "entry_amm_fee_embedded": entry_amm_fee,
+                   "entry_network_and_priority_cost": entry_cost}
     if exit_mark is None:
-        return {"status": "NO_FILL", "reason": "MISSING_HORIZON_MARK", "net_quote_raw": -assumptions.failed_transaction_cost_quote_raw,
-                "cash_ledger": {"failed_transaction_cost": assumptions.failed_transaction_cost_quote_raw}}
+        return {"status": "OPEN_POSITION", "reason": "MISSING_HORIZON_MARK", "realized_net_quote_raw": None,
+                "position_base_raw": base_out, "cash_ledger": base_ledger}
     if exit_mark.get("transition_model") != "CONSTANT_PRODUCT_EXACT_INPUT_V1" or exit_mark.get("exact_transition_validated") is not True:
         raise AdmissionBlocked("UNSUPPORTED_OR_UNVALIDATED_EXIT_TRANSITION")
-    if int(exit_mark.get("mark_available_at_unix_ns", -1)) < int(exit_mark.get("target_exit_at_unix_ns", 0)) + assumptions.exit_latency_ns:
-        return {"status": "NO_FILL", "reason": "EXIT_LATENCY_UNMET", "net_quote_raw": -assumptions.failed_transaction_cost_quote_raw,
-                "cash_ledger": {"failed_transaction_cost": assumptions.failed_transaction_cost_quote_raw}}
+    _validate_execution_fee(exit_mark)
+    exit_status = exit_mark.get("exit_attempt_status", "NO_FILL")
+    if exit_status not in {"FILLED", "FAILED", "NO_FILL"}:
+        raise AdmissionBlocked("INVALID_EXIT_ATTEMPT_STATUS")
+    if exit_status == "FAILED":
+        if not exit_mark.get("exit_failure_evidence_ref"):
+            raise AdmissionBlocked("FAILED_EXIT_EVIDENCE_REQUIRED")
+        return {"status": "OPEN_POSITION", "reason": "EXIT_ATTEMPT_FAILED", "realized_net_quote_raw": None,
+                "position_base_raw": base_out, "cash_ledger": {**base_ledger, "failed_attempt_cost": assumptions.failed_attempt_cost_quote_raw}}
+    if exit_status == "NO_FILL" or int(exit_mark.get("mark_available_at_unix_ns", -1)) < int(exit_mark.get("target_exit_at_unix_ns", 0)) + assumptions.exit_latency_ns:
+        return {"status": "OPEN_POSITION", "reason": "EXIT_LATENCY_UNMET" if exit_status != "NO_FILL" else str(exit_mark.get("no_fill_reason", "NO_EXIT_QUOTE")),
+                "realized_net_quote_raw": None, "position_base_raw": base_out, "cash_ledger": base_ledger}
     quote_out, exit_amm_fee = _constant_product_exact_input(int(exit_mark["pool_base_pre_raw"]), int(exit_mark["pool_quote_pre_raw"]),
                                                              base_out, int(exit_mark["amm_fee_bps"]), direction="SELL")
-    explicit_cost = 2 * (assumptions.network_fee_quote_raw + assumptions.priority_fee_quote_raw)
-    net = quote_out - assumptions.entry_notional_quote_raw - explicit_cost - assumptions.failed_transaction_cost_quote_raw
-    return {"status": "FILLED", "net_quote_raw": net,
-            "cash_ledger": {"entry_notional": assumptions.entry_notional_quote_raw, "entry_amm_fee_embedded": entry_amm_fee,
-                            "exit_amm_fee_embedded": exit_amm_fee, "exit_proceeds": quote_out,
-                            "network_and_priority_cost": explicit_cost, "failed_transaction_cost": assumptions.failed_transaction_cost_quote_raw},
+    exit_cost = assumptions.network_fee_quote_raw + assumptions.priority_fee_quote_raw
+    net = quote_out - assumptions.entry_notional_quote_raw - entry_cost - exit_cost
+    return {"status": "CLOSED_FILLED", "realized_net_quote_raw": net,
+            "position_base_raw": 0, "cash_ledger": {**base_ledger, "exit_amm_fee_embedded": exit_amm_fee,
+                            "exit_proceeds": quote_out, "exit_network_and_priority_cost": exit_cost},
             "base_received_raw": base_out}
 
 
@@ -348,9 +445,9 @@ def fixed_horizon_marks(entry: dict[str, Any], marks_by_seconds: dict[int, dict[
             for seconds in EXPLORATORY_HORIZONS_SECONDS}
 
 
-def chronological_evaluate(partition_proof: dict[str, Any], decisions: Iterable[dict[str, Any]], *, budget: "ResourceBudget") -> dict[str, Any]:
+def chronological_evaluate(partition_proof: dict[str, Any], decisions: Iterable[dict[str, Any]], *, budget: "ResourceBudget", proof_bundle: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return blocked results unless real-data provenance and cost evidence pass."""
-    admission = validate_partition_admission(partition_proof)
+    admission = validate_partition_admission(partition_proof, proof_bundle)
     start = time.monotonic(); cpu_started = time.process_time(); rows = list(decisions)
     if len(rows) > budget.max_rows:
         raise BudgetExceeded("MAX_ROWS_EXCEEDED")
@@ -359,7 +456,7 @@ def chronological_evaluate(partition_proof: dict[str, Any], decisions: Iterable[
     if time.process_time() - cpu_started > budget.max_cpu_seconds:
         raise BudgetExceeded("CPU_BUDGET_EXCEEDED")
     for row in rows:
-        validate_decision_boundary(row.get("decision_boundary", {}), partition_proof)
+        validate_decision_boundary(row.get("decision_boundary", {}), partition_proof, proof_bundle)
         if row.get("cost_evidence_ref") in (None, ""):
             return {"status": "BLOCKED", "reason": "MISSING_INDEPENDENT_EXECUTION_COST_EVIDENCE", "admission": admission}
     return {"status": "READY_FOR_EXPLORATORY_EVALUATION", "admission": admission, "decision_count": len(rows)}
