@@ -1,0 +1,41 @@
+{
+  "actual_recovered_bytes": 23238074368,
+  "after_free_bytes": 171564290048,
+  "all_absent": true,
+  "before_free_bytes": 148326215680,
+  "deleted": [
+    {
+      "absent_after_delete": true,
+      "expected_allocated_bytes": 13808775168,
+      "expected_du_bytes": 13605298172,
+      "path": "/mnt/edgesniffer-kefi-hot/.canonical-finalized-rpc-build-20261015T0900Z"
+    },
+    {
+      "absent_after_delete": true,
+      "expected_allocated_bytes": 7297204224,
+      "expected_du_bytes": 7218000859,
+      "path": "/mnt/edgesniffer-kefi-hot/.canonical-inventory-conformance-build-20261015T0738Z"
+    },
+    {
+      "absent_after_delete": true,
+      "expected_allocated_bytes": 1083961344,
+      "expected_du_bytes": 1066090987,
+      "path": "/mnt/edgesniffer-kefi-hot/kefi-capture-first-build"
+    },
+    {
+      "absent_after_delete": true,
+      "expected_allocated_bytes": 1048133632,
+      "expected_du_bytes": 1030968755,
+      "path": "/mnt/edgesniffer-kefi-hot/kefi-build-v8"
+    }
+  ],
+  "execution_sha256": "4f4f0087299ec5e4876ad7fdc6d8d5b7adaeffec1e00d22170316dd7be418834",
+  "expected_allocated_bytes": 23238074368,
+  "expected_du_bytes": 22920358773,
+  "preflight_receipt": "/root/edgesniffer-retirement-receipts/hot-build-cache-eviction-preflight-20261015T225147Z.json",
+  "preflight_sha256": "0d8fa43637798bba22f272b3444a51cf05036834fabd67597f2cd5cacd06f5fc",
+  "schema": "EDGESNIFFER_HOT_BUILD_CACHE_EVICTION_EXECUTION_V2",
+  "scope": "only four explicitly authorized hot build directories",
+  "source_commit": "2f844c1859444d94b98af1e67e1de59ec86f02be",
+  "timestamp_utc": "2026-10-15T22:51:51.370068+00:00"
+}

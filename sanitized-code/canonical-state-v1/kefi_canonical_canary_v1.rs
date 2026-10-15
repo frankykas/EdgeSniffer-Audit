@@ -28,7 +28,8 @@ struct CanaryHealth {
     raw_fixture_bytes: u64, raw_fixture_cap_bytes: u64, semantic_events: u64, semantic_bytes: u64,
     source_updates: u64, pending_slots: usize, closed_slots: u64, order_ambiguous_events: u64,
     decoder_rejections: u64, identity_failures: u64, late_after_slot_close: u64,
-    hot_available_bytes: u64, protected_reserve_bytes: u64, max_total_bytes: u64,
+    hot_available_bytes: u64, startup_free_bytes: u64, protected_reserve_bytes: u64,
+    startup_floor_bytes: u64, max_total_bytes: u64,
     stop_reason: Option<String>, last_slot: Option<u64>,
 }
 
@@ -43,6 +44,22 @@ fn free_bytes(path: &PathBuf) -> Result<u64> {
     let output = Command::new("df").args(["-B1", "--output=avail", path.to_str().context("non-utf8 root")?]).output()?;
     if !output.status.success() { bail!("df failed") }
     String::from_utf8(output.stdout)?.lines().nth(1).context("df output missing")?.trim().parse().context("invalid df available bytes")
+}
+
+// The start floor preserves the runtime reserve even if the canary consumes
+// its entire bounded output quota. Runtime checks additionally fail closed if
+// another workload consumes the predeclared operating buffer.
+fn valid_storage_policy(reserve: u64, total_cap: u64, start_floor: u64) -> bool {
+    total_cap > 0 && start_floor >= reserve.saturating_add(total_cap)
+}
+
+fn startup_storage_allowed(free: u64, reserve: u64, total_cap: u64, start_floor: u64) -> bool {
+    valid_storage_policy(reserve, total_cap, start_floor) && free >= start_floor
+}
+
+fn runtime_storage_allowed(free: u64, reserve: u64, total_cap: u64, bytes_written: u64) -> bool {
+    if bytes_written > total_cap { return false; }
+    free >= reserve.saturating_add(total_cap - bytes_written)
 }
 
 fn request() -> SubscribeRequest {
@@ -96,11 +113,13 @@ async fn main() -> Result<()> {
     let raw_cap: u64 = env::var("CANONICAL_CANARY_RAW_CAP_BYTES").context("CANONICAL_CANARY_RAW_CAP_BYTES missing")?.parse()?;
     let total_cap: u64 = env::var("CANONICAL_CANARY_TOTAL_CAP_BYTES").context("CANONICAL_CANARY_TOTAL_CAP_BYTES missing")?.parse()?;
     let reserve: u64 = env::var("CANONICAL_CANARY_PROTECTED_RESERVE_BYTES").context("CANONICAL_CANARY_PROTECTED_RESERVE_BYTES missing")?.parse()?;
+    let startup_floor: u64 = env::var("CANONICAL_CANARY_START_FLOOR_BYTES").context("CANONICAL_CANARY_START_FLOOR_BYTES missing")?.parse()?;
     let max_seconds: u64 = env::var("CANONICAL_CANARY_MAX_SECONDS").context("CANONICAL_CANARY_MAX_SECONDS missing")?.parse()?;
     let fixture_ttl_seconds: u64 = env::var("CANONICAL_CANARY_FIXTURE_TTL_SECONDS").unwrap_or_else(|_| "86400".to_owned()).parse()?;
-    if raw_cap == 0 || total_cap < raw_cap || max_seconds == 0 { bail!("invalid bounded canary limits") }
+    if raw_cap == 0 || total_cap < raw_cap || max_seconds == 0 || !valid_storage_policy(reserve, total_cap, startup_floor) { bail!("invalid bounded canary storage policy") }
     fs::create_dir_all(&root)?;
-    if free_bytes(&root)? <= reserve { bail!("protected hot-storage reserve is already breached") }
+    let startup_free = free_bytes(&root)?;
+    if !startup_storage_allowed(startup_free, reserve, total_cap, startup_floor) { bail!("hot-storage startup floor is not met") }
     let source = format!("canonical-canary-{}-pid{}", Utc::now().format("%Y%m%dT%H%M%S%3fZ"), std::process::id());
     let raw_root = root.join("validation-fixture-ttl"); fs::create_dir_all(&raw_root)?;
     write_atomic(&root.join("fixture-ttl.json"), &serde_json::json!({
@@ -111,7 +130,7 @@ async fn main() -> Result<()> {
     let mut raw_writer = LedgerWriter::open(&raw_root)?;
     let mut semantic_writer = JournalWriter::open(&root.join("semantic-journal"), "1", 1, 4096)?;
     let health_path = root.join("health.json");
-    let mut health = CanaryHealth { schema: "EDGESNIFFER_CANONICAL_CANARY_V1".to_owned(), status: "RUNNING".to_owned(), source_instance_id: source.clone(), continuity_epoch: "1".to_owned(), raw_fixture_cap_bytes: raw_cap, protected_reserve_bytes: reserve, max_total_bytes: total_cap, hot_available_bytes: free_bytes(&root)?, ..CanaryHealth::default() };
+    let mut health = CanaryHealth { schema: "EDGESNIFFER_CANONICAL_CANARY_V1".to_owned(), status: "RUNNING".to_owned(), source_instance_id: source.clone(), continuity_epoch: "1".to_owned(), raw_fixture_cap_bytes: raw_cap, protected_reserve_bytes: reserve, startup_floor_bytes: startup_floor, startup_free_bytes: startup_free, max_total_bytes: total_cap, hot_available_bytes: startup_free, ..CanaryHealth::default() };
     let channel = Channel::from_shared(endpoint)?.tls_config(ClientTlsConfig::new().with_native_roots())?.connect_timeout(Duration::from_secs(10)).connect().await?;
     let interceptor = token.clone();
     let mut client = GeyserClient::with_interceptor(channel, move |mut request: Request<()>| { request.metadata_mut().insert("x-token", interceptor.clone()); Ok::<_, Status>(request) }).max_decoding_message_size(128 * 1024 * 1024);
@@ -140,7 +159,11 @@ async fn main() -> Result<()> {
         raw_sequence += 1; let raw = update.encode_to_vec();
         if health.raw_fixture_bytes.saturating_add(raw.len() as u64) > raw_cap { health.stop_reason = Some("RAW_FIXTURE_CAP_REACHED".into()); break; }
         if health.raw_fixture_bytes.saturating_add(health.semantic_bytes).saturating_add(raw.len() as u64) > total_cap { health.stop_reason = Some("TOTAL_CANARY_CAP_REACHED".into()); break; }
-        if health.source_updates % 512 == 0 { health.hot_available_bytes = free_bytes(&root)?; if health.hot_available_bytes <= reserve { health.stop_reason = Some("PROTECTED_RESERVE_REACHED".into()); break; } }
+        // Check every update before writing: storage-query errors propagate and
+        // fail closed, while a concurrent consumer cannot erode the reserve.
+        health.hot_available_bytes = free_bytes(&root)?;
+        let written = health.raw_fixture_bytes.saturating_add(health.semantic_bytes);
+        if !runtime_storage_allowed(health.hot_available_bytes, reserve, total_cap, written) { health.stop_reason = Some("PROTECTED_RESERVE_RISK".into()); break; }
         let record = raw_record(&update, raw, &source, raw_sequence); health.raw_fixture_bytes += record.raw.len() as u64; health.source_updates += 1;
         raw_writer.append_buffered(Utc::now(), record.clone())?;
         if let Some(UpdateOneof::Block(block)) = update.update_oneof {
@@ -204,5 +227,31 @@ mod tests {
         assert_eq!(filter.include_entries, Some(false));
         assert!(filter.account_include.contains(&PUMP_PROGRAM.to_owned()));
         assert!(filter.account_include.contains(&PUMPSWAP_PROGRAM.to_owned()));
+    }
+
+    #[test]
+    fn startup_requires_the_full_reserve_cap_and_operational_buffer() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let reserve = 160 * gib;
+        let cap = 6 * gib;
+        let floor = 181 * gib;
+        assert!(startup_storage_allowed(floor, reserve, cap, floor));
+        assert!(!startup_storage_allowed(floor - 1, reserve, cap, floor));
+        assert!(!startup_storage_allowed(floor, reserve, cap, reserve + cap - 1));
+    }
+
+    #[test]
+    fn runtime_fails_closed_when_concurrent_consumption_uses_the_buffer() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let reserve = 160 * gib;
+        let cap = 6 * gib;
+        // At startup the six GiB future output remains protected.
+        assert!(runtime_storage_allowed(181 * gib, reserve, cap, 0));
+        assert!(!runtime_storage_allowed(165 * gib, reserve, cap, 0));
+        // After four GiB is durably written, only the remaining two GiB must
+        // still fit above the protected reserve.
+        assert!(runtime_storage_allowed(162 * gib, reserve, cap, 4 * gib));
+        assert!(!runtime_storage_allowed(161 * gib, reserve, cap, 4 * gib));
+        assert!(!runtime_storage_allowed(170 * gib, reserve, cap, cap + 1));
     }
 }
