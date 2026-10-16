@@ -1,10 +1,11 @@
 //! Offline-only durable identity manifest and finalized-block reconciliation.
 //!
 //! The manifest is deliberately written *before* wallet/candidate selection.
-//! It preserves Yellowstone arrival provenance without treating arrival or an
-//! observed provider index as canonical Solana order.  The reconciler compares
-//! that complete received identity set with a finalized block-derived,
-//! program/account-filtered identity set.  Any mismatch is a hard failure.
+//! It preserves Yellowstone delivery provenance and its independent block
+//! transaction-index cross-check without treating either as canonical Solana
+//! order. The reconciler compares that complete received identity set with a
+//! finalized block-derived, program/account-filtered identity set. Any
+//! identity or source-index mismatch is a hard failure.
 
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}};
 
@@ -51,11 +52,14 @@ pub struct FilteredIdentity {
     pub signature: String,
     pub receive_sequence: String,
     pub received_at_unix_ns: String,
-    /// Backward-compatible field name for Yellowstone
-    /// `SubscribeUpdateTransactionInfo.index`: the source transaction index
-    /// in its block. Receive sequence and timestamp are the arrival
-    /// provenance. Finalized RPC remains the authoritative ordering source.
-    pub observed_arrival_index: Option<String>,
+    /// Yellowstone `SubscribeUpdateTransactionInfo.index`: the source
+    /// transaction index in its block. This intentionally retains the legacy
+    /// serialized `observedArrivalIndex` key so existing immutable manifests
+    /// and their semantic hashes remain readable. Receive sequence and
+    /// timestamp are the delivery provenance. Finalized RPC remains the
+    /// authoritative ordering source.
+    #[serde(rename = "observedArrivalIndex", alias = "sourceTransactionIndex")]
+    pub source_transaction_index: Option<String>,
     pub source_frame_sha256: String,
     pub continuity_status: String,
     pub previous_record_sha256: String,
@@ -195,13 +199,13 @@ impl FilteredIdentityManifestWriter {
         Ok(writer)
     }
 
-    pub fn append(&mut self, slot: u64, signature: &str, received_at_unix_ns: u128, observed_arrival_index: Option<u64>, source_frame_sha256: &str) -> Result<FilteredIdentity> {
+    pub fn append(&mut self, slot: u64, signature: &str, received_at_unix_ns: u128, source_transaction_index: Option<u64>, source_frame_sha256: &str) -> Result<FilteredIdentity> {
         if signature.is_empty() || source_frame_sha256.is_empty() { bail!("MANIFEST_INPUT_INVALID") }
         let identity = (slot.to_string(), signature.to_owned());
         if self.identities.contains(&identity) { bail!("MANIFEST_DUPLICATE_IDENTITY") }
         self.policy.permit_identity_count(self.identities.len())?;
         self.identities.insert(identity.clone());
-        let candidate = FilteredIdentity { schema: String::new(), manifest_sequence: self.next_manifest_sequence.to_string(), source_instance_id: self.source_instance_id.clone(), continuity_epoch: self.continuity_epoch.clone(), slot: slot.to_string(), signature: signature.to_owned(), receive_sequence: self.next_receive_sequence.to_string(), received_at_unix_ns: received_at_unix_ns.to_string(), observed_arrival_index: observed_arrival_index.map(|value| value.to_string()), source_frame_sha256: source_frame_sha256.to_owned(), continuity_status: "CONTINUOUS".to_owned(), previous_record_sha256: String::new(), record_sha256: String::new() }.seal(self.tail.clone())?;
+        let candidate = FilteredIdentity { schema: String::new(), manifest_sequence: self.next_manifest_sequence.to_string(), source_instance_id: self.source_instance_id.clone(), continuity_epoch: self.continuity_epoch.clone(), slot: slot.to_string(), signature: signature.to_owned(), receive_sequence: self.next_receive_sequence.to_string(), received_at_unix_ns: received_at_unix_ns.to_string(), source_transaction_index: source_transaction_index.map(|value| value.to_string()), source_frame_sha256: source_frame_sha256.to_owned(), continuity_status: "CONTINUOUS".to_owned(), previous_record_sha256: String::new(), record_sha256: String::new() }.seal(self.tail.clone())?;
         let mut bytes = jcs_bytes(&serde_json::to_value(&candidate)?)?;
         bytes.push(b'\n');
         if let Err(error) = self.policy.permit(self.bytes_written, bytes.len() as u64) {
@@ -410,23 +414,40 @@ pub fn reconcile_finalized_block(epoch_id: &str, source_instance_id: &str, conti
     let expected: usize = block.executed_transaction_count.parse().context("BLOCK_COUNT_INVALID")?;
     if block.transactions.len() != expected { bail!("BLOCK_INVENTORY_INCOMPLETE") }
     if block.transactions.len() > MAX_IDENTITIES_PER_SLOT { bail!("BLOCK_RECONCILIATION_MEMORY_CAP") }
-    let mut seen_indexes = BTreeSet::new(); let mut seen_signatures = BTreeSet::new(); let mut block_relevant = BTreeSet::new();
+    let mut seen_indexes = BTreeSet::new(); let mut seen_signatures = BTreeSet::new(); let mut block_relevant = BTreeMap::new();
     for transaction in block.transactions {
         let index: usize = transaction.transaction_index.parse().context("BLOCK_TRANSACTION_INDEX_INVALID")?;
         if index >= expected || !seen_indexes.insert(index) || !seen_signatures.insert(transaction.signature.clone()) { bail!("BLOCK_ORDER_OR_IDENTITY_CONFLICT") }
         transaction.require_supported_version()?;
         if transaction.is_relevant_to(canonical_program_ids) {
-            block_relevant.insert((block.slot.clone(), transaction.signature));
+            if block_relevant.insert((block.slot.clone(), transaction.signature), index).is_some() {
+                bail!("BLOCK_RELEVANT_DUPLICATE_IDENTITY")
+            }
         }
     }
     if seen_indexes.len() != expected { bail!("BLOCK_INDEX_INVENTORY_INCOMPLETE") }
     validate_manifest_chain(manifest, source_instance_id, continuity_epoch)?;
-    let mut observed = BTreeSet::new();
+    let mut observed = BTreeMap::new();
     for identity in manifest.iter().filter(|identity| identity.slot == block.slot) {
-        if !observed.insert((identity.slot.clone(), identity.signature.clone())) { bail!("MANIFEST_DUPLICATE_IDENTITY") }
+        let source_index = identity.source_transaction_index.as_deref()
+            .map(|value| value.parse::<usize>().context("FILTERED_SOURCE_TRANSACTION_INDEX_INVALID"))
+            .transpose()?;
+        if observed.insert((identity.slot.clone(), identity.signature.clone()), source_index).is_some() { bail!("MANIFEST_DUPLICATE_IDENTITY") }
     }
     if observed.len() > MAX_IDENTITIES_PER_SLOT { bail!("MANIFEST_RECONCILIATION_MEMORY_CAP") }
-    let (disposition, reason_code) = if observed == block_relevant { ("MATCHED", None) } else if observed.is_subset(&block_relevant) { ("REJECTED", Some("MISSING_FILTERED_IDENTITY".to_owned())) } else if block_relevant.is_subset(&observed) { ("REJECTED", Some("EXTRA_FILTERED_IDENTITY".to_owned())) } else { ("REJECTED", Some("FILTERED_IDENTITY_SET_CONFLICT".to_owned())) };
+    let observed_identities: BTreeSet<_> = observed.keys().cloned().collect();
+    let block_identities: BTreeSet<_> = block_relevant.keys().cloned().collect();
+    let (disposition, reason_code) = if observed_identities != block_identities {
+        if observed_identities.is_subset(&block_identities) { ("REJECTED", Some("MISSING_FILTERED_IDENTITY".to_owned())) }
+        else if block_identities.is_subset(&observed_identities) { ("REJECTED", Some("EXTRA_FILTERED_IDENTITY".to_owned())) }
+        else { ("REJECTED", Some("FILTERED_IDENTITY_SET_CONFLICT".to_owned())) }
+    } else if observed.values().any(Option::is_none) {
+        ("REJECTED", Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISSING".to_owned()))
+    } else if observed.iter().any(|(identity, source_index)| block_relevant.get(identity) != source_index.as_ref()) {
+        ("REJECTED", Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISMATCH".to_owned()))
+    } else {
+        ("MATCHED", None)
+    };
     Ok(ReconciliationReceipt { schema: FINALIZED_RECONCILIATION_SCHEMA.to_owned(), epoch_id: epoch_id.to_owned(), source_instance_id: source_instance_id.to_owned(), continuity_epoch: continuity_epoch.to_owned(), slot: block.slot, block_identity: block.block_identity, manifest_identity_count: observed.len().to_string(), block_relevant_identity_count: block_relevant.len().to_string(), disposition: disposition.to_owned(), reason_code, receipt_sha256: String::new() }.seal()?)
 }
 
@@ -461,9 +482,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_extra_and_duplicate_identities_fail_closed() {
+    fn source_transaction_index_mismatch_fails_closed() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, Some(3), "raw").unwrap();
+        let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
+        assert_eq!(receipt.disposition, "REJECTED");
+        assert_eq!(receipt.reason_code.as_deref(), Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISMATCH"));
+    }
+
+    #[test]
+    fn missing_source_transaction_index_fails_closed_after_identity_membership_checks() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
         out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
+        assert_eq!(receipt.disposition, "REJECTED");
+        assert_eq!(receipt.reason_code.as_deref(), Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISSING"));
+    }
+
+    #[test]
+    fn source_index_rename_preserves_legacy_manifest_json_and_hash_validation() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, Some(0), "raw").unwrap();
+        let raw = fs::read_to_string(root.path().join("epoch-a.filtered-identities.jsonl")).unwrap();
+        assert!(raw.contains("\"observedArrivalIndex\":\"0\""));
+        assert!(!raw.contains("sourceTransactionIndex"));
+        let record: FilteredIdentity = serde_json::from_str(raw.trim()).unwrap();
+        record.validate(0, "").unwrap();
+    }
+
+    #[test]
+    fn missing_extra_and_duplicate_identities_fail_closed() {
+        let root = tempdir().unwrap(); let mut out = writer(root.path());
+        out.append(10, "sig-10-0", 1, Some(0), "raw").unwrap();
         let missing = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0", "sig-10-2"]), &all_records(root.path()), &programs()).unwrap();
         assert_eq!(missing.reason_code.as_deref(), Some("MISSING_FILTERED_IDENTITY"));
         assert!(out.append(10, "sig-10-0", 2, None, "raw").unwrap_err().to_string().contains("DUPLICATE"));
@@ -474,7 +524,7 @@ mod tests {
     #[test]
     fn gaps_forks_versions_and_capture_storage_fail_closed() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
-        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        out.append(10, "sig-10-0", 1, Some(0), "raw").unwrap();
         let mut bad = block(10, &["sig-10-0"]); bad.transactions[1].transaction_index = "0".into();
         assert!(reconcile_finalized_block("epoch-a", "source-a", "7", bad, &all_records(root.path()), &programs()).is_err());
         let mut unsupported = block(10, &["sig-10-0"]); unsupported.transactions[0].supported_version = false;
@@ -517,7 +567,7 @@ mod tests {
     #[test]
     fn interval_proof_requires_reconciled_start_and_unbroken_epoch() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
-        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        out.append(10, "sig-10-0", 1, Some(0), "raw").unwrap();
         let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
         let complete = IntervalCompleteness {
             epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(),
@@ -536,7 +586,7 @@ mod tests {
     #[test]
     fn interval_cannot_claim_coverage_from_a_partial_receipt_list() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
-        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        out.append(10, "sig-10-0", 1, Some(0), "raw").unwrap();
         let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
         let incomplete = IntervalCompleteness {
             epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(),
@@ -551,7 +601,7 @@ mod tests {
     #[test]
     fn finalized_skipped_slot_requires_authoritative_status_and_no_identity() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
-        out.append(10, "sig-10-0", 1, None, "raw").unwrap();
+        out.append(10, "sig-10-0", 1, Some(0), "raw").unwrap();
         let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
         let valid = IntervalCompleteness {
             epoch_id: "epoch-a".into(), source_instance_id: "source-a".into(), continuity_epoch: "7".into(),
