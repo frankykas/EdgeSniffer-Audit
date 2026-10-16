@@ -1,0 +1,31 @@
+[Unit]
+Description=EdgeSniffer Canonical State V1 finalized-RPC bounded reconciliation canary
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/edgesniffer-canonical-hot
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/edgesniffer/kefi-full-meta.env
+EnvironmentFile=/etc/edgesniffer/kefi-choice-state-observer-v1-live.env
+EnvironmentFile=/root/bot/EdgeSniffer/.env
+Environment=YELLOWSTONE_FULL_META_ENDPOINT=https://grpc.fra.shyft.to
+Environment=FINALIZED_RECONCILIATION_CANARY_ROOT=/mnt/edgesniffer-canonical-hot/canonical-state-v1-canary-next
+Environment=CANONICAL_CANARY_TOTAL_CAP_BYTES=6442450944
+Environment=CANONICAL_CANARY_PROTECTED_RESERVE_BYTES=171798691840
+Environment=CANONICAL_CANARY_START_FLOOR_BYTES=194347270144
+Environment=CANONICAL_CANARY_MAX_SECONDS=2700
+ExecStartPre=/usr/bin/mountpoint -q /mnt/edgesniffer-canonical-hot
+ExecStartPre=/bin/sh -c 'test "$(findmnt -no SOURCE --target /mnt/edgesniffer-canonical-hot)" = "/dev/vdd1"'
+ExecStartPre=/bin/sh -c 'test "$(df -B1 --output=avail /mnt/edgesniffer-canonical-hot | tail -n1 | tr -d " ")" -ge 194347270144'
+ExecStart=/usr/local/lib/edgesniffer/edgesniffer-kefi-finalized-rpc-canary-v1
+Restart=no
+RuntimeMaxSec=48m
+MemoryMax=8G
+CPUQuota=200%
+IOSchedulingClass=idle
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
