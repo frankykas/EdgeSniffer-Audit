@@ -53,6 +53,10 @@ pub struct FullTransactionInput {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SemanticEventInput {
+    /// Stable caller-supplied identity for the raw semantic event. It is not
+    /// part of causal ordering; it prevents a multi-event transaction from
+    /// losing the one-to-one correspondence with its source event.
+    pub event_id: String,
     /// The already-decoded event must name the program which emitted it.
     pub expected_program_id: String,
     /// Canonical Pool identity from the event. It is used only to match the
@@ -86,6 +90,7 @@ impl InstructionPath {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DecodedSemanticEvent {
+    pub event_id: String,
     pub signature: String,
     pub canonical_order: CanonicalOrderTuple,
     pub semantic_kind: String,
@@ -214,7 +219,7 @@ pub fn decode_instruction_paths(input: &FullTransactionInput, events: &[Semantic
     let mut used_paths = BTreeSet::new();
     let mut ordinals = BTreeMap::<InstructionPath, usize>::new();
     for event in events {
-        if !target_program(&event.expected_program_id) || event.pool.is_empty() || event.semantic_kind.is_empty() {
+        if event.event_id.is_empty() || !target_program(&event.expected_program_id) || event.pool.is_empty() || event.semantic_kind.is_empty() {
             bail!("SEMANTIC_EVENT_INPUT_UNSUPPORTED")
         }
         if active_programs.get(event.log_index).and_then(|program| program.as_deref()) != Some(event.expected_program_id.as_str()) {
@@ -232,6 +237,7 @@ pub fn decode_instruction_paths(input: &FullTransactionInput, events: &[Semantic
         let semantic_ordinal = *ordinals.entry(invocation.path.clone()).or_default();
         *ordinals.get_mut(&invocation.path).expect("entry exists") += 1;
         emitted.push(DecodedSemanticEvent {
+            event_id: event.event_id.clone(),
             signature: input.signature.clone(),
             canonical_order: CanonicalOrderTuple { slot: input.slot, finalized_transaction_index: transaction_index, instruction_path: invocation.path.clone(), semantic_ordinal },
             semantic_kind: event.semantic_kind.clone(), pool: event.pool.clone(),
@@ -267,7 +273,7 @@ mod tests {
     const SELL: &[u8] = b"sell-disc";
 
     fn event(program: &str, pool: &str, log_index: usize, discriminator: &[u8]) -> SemanticEventInput {
-        SemanticEventInput { expected_program_id: program.into(), pool: pool.into(), log_index, accepted_instruction_discriminators: vec![discriminator.to_vec()], semantic_kind: "SWAP".into() }
+        SemanticEventInput { event_id: format!("{pool}:{log_index}"), expected_program_id: program.into(), pool: pool.into(), log_index, accepted_instruction_discriminators: vec![discriminator.to_vec()], semantic_kind: "SWAP".into() }
     }
     fn instruction(program_index: usize, accounts: &[usize], data: &[u8]) -> CompiledInstructionInput {
         CompiledInstructionInput { program_id_index: program_index, account_indexes: accounts.to_vec(), data: data.to_vec() }
