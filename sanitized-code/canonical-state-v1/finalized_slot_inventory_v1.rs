@@ -6,7 +6,7 @@
 //! explicitly retained as finalized-skipped, never inferred from filtered
 //! Yellowstone silence.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::canonical_state_v1::hash_excluding_field;
 
 pub const FINALIZED_SLOT_INVENTORY_SCHEMA: &str = "EDGESNIFFER_FINALIZED_SLOT_INVENTORY_V1";
-pub const MAX_DIAGNOSTIC_RANGE_SLOTS: u64 = 16;
+/// `getBlocks` consumes one request, leaving at most fifteen `getBlock`
+/// requests under the fixed sixteen-call diagnostic budget before any prior
+/// producer reconciliation calls are considered.
+pub const MAX_DIAGNOSTIC_RANGE_SLOTS: u64 = 15;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +62,30 @@ fn digest(value: &str, label: &str) -> Result<()> {
 }
 
 impl FinalizedSlotInventory {
+    pub fn write_atomic(&self, root: &Path) -> Result<()> {
+        self.validate()?;
+        let bytes = crate::canonical_state_v1::jcs_bytes(&serde_json::to_value(self)?)?;
+        let temporary = root.join(".finalized-slot-inventory.tmp");
+        fs::write(&temporary, bytes)?;
+        fs::rename(temporary, root.join("finalized-slot-inventory.json"))?;
+        Ok(())
+    }
+
+    pub fn read_verified(root: &Path) -> Result<Self> {
+        let path = root.join("finalized-slot-inventory.json");
+        let bytes = fs::read(&path)?;
+        let output: Self = serde_json::from_slice(&bytes)?;
+        output.validate()?;
+        if bytes != crate::canonical_state_v1::jcs_bytes(&serde_json::to_value(&output)?)? {
+            bail!("SLOT_INVENTORY_SERIALIZATION_NONCANONICAL")
+        }
+        let response = fs::read(root.join("finalized-getblocks-response.json"))?;
+        if crate::sha256_hex(&response) != output.get_blocks_response_sha256 {
+            bail!("GET_BLOCKS_RESPONSE_PROOF_HASH_MISMATCH")
+        }
+        Ok(output)
+    }
+
     pub fn seal(
         source_instance_id: &str,
         continuity_epoch: &str,
@@ -143,6 +170,6 @@ mod tests {
     }
     #[test]
     fn range_budget_is_bounded() {
-        assert!(FinalizedSlotInventory::seal("source", "epoch", 1, 17, H, &[], vec![]).is_err());
+        assert!(FinalizedSlotInventory::seal("source", "epoch", 1, 16, H, &[], vec![]).is_err());
     }
 }

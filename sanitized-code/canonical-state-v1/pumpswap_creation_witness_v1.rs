@@ -14,6 +14,7 @@ pub const CREATE_POOL:[u8;8]=[233,146,209,142,207,104,64,188];
 const CREATE_POOL_EVENT:[u8;8]=[177,49,12,210,160,118,167,116];
 
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(rename_all="camelCase")]
 pub struct CreationWitness { pub pool:String,pub mint:String,pub quote_mint:String,pub creator:String,pub slot:String,pub signature:String,pub transaction_index:String,pub instruction_path:String,pub event_id:String,pub create_event_sha256:String,pub origin:String }
 #[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
 pub struct CreationQuarantine { pub signature:String,pub reason_code:String }
