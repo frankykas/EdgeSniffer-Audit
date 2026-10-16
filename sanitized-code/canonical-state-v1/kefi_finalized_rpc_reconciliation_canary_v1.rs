@@ -31,6 +31,21 @@ const PROTECTED_RESERVE: u64 = 160 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DiagnosticRpcReservation { range_slots:u64, inventory_requests:u64, dispatcher_limit:u64 }
 
+#[derive(Clone)]
+struct PendingFinalizedRange {
+    start: u64,
+    end: u64,
+    get_blocks_response: Value,
+    blocks: Vec<(FinalizedBlockInput, Vec<Value>)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingRangeReadiness {
+    AwaitingSourceFinalizedStatus,
+    AwaitingSourceIdentities,
+    ReadyToSeal,
+}
+
 #[derive(Serialize)] #[serde(rename_all="camelCase")]
 struct Report { schema:String, status:String, started_at_utc:String, finished_at_utc:String, slots_observed:usize, slots_reconciled:usize, slots_rejected:usize, exact_passes:usize, failures:usize, rpc_calls:u64, dispatcher_rpc_calls:u64, dispatcher_retry_rpc_calls:u64, inventory_get_blocks_rpc_calls:u64, inventory_get_block_rpc_calls:u64, retries:u64, pending_slot_peak:usize, max_rss_bytes:u64, max_message_bytes:usize, disk_growth_bytes:u64, decoder_transactions:u64, decoder_events:u64, decoder_rejections:u64, source_gap_or_epoch_failure:bool, unresolved:String, reconciled_slot_produced:bool, scientific_interval_produced:bool, failure:Option<String> }
 
@@ -78,15 +93,25 @@ fn finalized_slot_inventory_from_mocked_rpc(root:&PathBuf,source:&str,epoch:&str
     // all EdgeSniffer receipts below are separately JCS-bound.
     let response_bytes=serde_json::to_vec(get_blocks_response)?;let response_sha=pump_exact_evidence_ledger::sha256_hex(&response_bytes);let tmp=root.join(".finalized-getblocks-response.tmp");fs::write(&tmp,response_bytes)?;fs::rename(tmp,root.join("finalized-getblocks-response.json"))?;let mut blocks_by_slot=BTreeMap::new();for(block,transactions)in blocks{let slot:u64=block.slot.parse()?;if blocks_by_slot.insert(slot,(block,transactions)).is_some(){bail!("FINALIZED_RANGE_DUPLICATE_BLOCK_RESPONSE")}}let mut proofs=Vec::new();for slot in &produced{let(proof,transactions)=blocks_by_slot.remove(slot).context("FINALIZED_RANGE_BLOCK_RESPONSE_MISSING")?;let receipt=reconcile_finalized_block(epoch,source,"1",proof.clone(),records,&programs())?;if receipt.disposition!="MATCHED"||receipt.reason_code.is_some(){bail!("FINALIZED_RANGE_RECONCILIATION_INCOMPLETE")}let bundle=producer_slot_bundle(source,epoch,receipt,&transactions,events)?;bundle.write_atomic(root)?;proofs.push(ReconciledProducedSlot{slot:slot.to_string(),block_identity:proof.block_identity,slot_reconciliation_receipt_sha256:bundle.reconciliation.receipt_sha256.clone()});}if !blocks_by_slot.is_empty(){bail!("FINALIZED_RANGE_UNEXPECTED_BLOCK_RESPONSE")}let inventory=FinalizedSlotInventory::seal(source,"1",start,end,&response_sha,&produced,proofs)?;inventory.write_atomic(root)?;Ok(inventory)
 }
-async fn bounded_finalized_slot_inventory(http:&reqwest::Client,url:&str,root:&PathBuf,source:&str,epoch:&str,start:u64,end:u64,budget:&mut RpcBudget,report:&mut Report,records:&[FilteredIdentity],events:&HashMap<String,Vec<RawSemanticEvent>>)->Result<FinalizedSlotInventory>{
+async fn fetch_pending_finalized_range(http:&reqwest::Client,url:&str,root:&PathBuf,start:u64,end:u64,budget:&mut RpcBudget,report:&mut Report)->Result<PendingFinalizedRange>{
     diagnostic_range_preflight(budget,start,end)?; budget.consume_one()?; report.inventory_get_blocks_rpc_calls+=1;
     let response:Value=http.post(url).json(&json!({"jsonrpc":"2.0","id":"bounded-finalized-slot-inventory","method":"getBlocks","params":[start,end,{"commitment":"finalized"}]})).send().await?.error_for_status()?.json().await?;
     if response.get("error").is_some(){bail!("GET_BLOCKS_RPC_ERROR")}
+    let response_bytes=serde_json::to_vec(&response)?;let response_tmp=root.join(".finalized-getblocks-response.tmp");fs::write(&response_tmp,response_bytes)?;fs::rename(response_tmp,root.join("finalized-getblocks-response.json"))?;
     let result=response.get("result").and_then(Value::as_array).context("GET_BLOCKS_RESULT")?;
     let produced=result.len();
     if budget.used_requests().saturating_add(produced as u64)>budget.maximum_requests {bail!("FINALIZED_RANGE_RPC_BUDGET_INSUFFICIENT")}
     let mut blocks=Vec::new();for value in result {let slot=value.as_u64().context("GET_BLOCKS_SLOT")?;budget.consume_one()?;report.inventory_get_block_rpc_calls+=1;blocks.push(block(http,url,slot).await?)}
-    finalized_slot_inventory_from_mocked_rpc(root,source,epoch,start,end,&response,blocks,records,events)
+    Ok(PendingFinalizedRange {start,end,get_blocks_response:response,blocks})
+}
+fn pending_range_readiness(pending:&PendingFinalizedRange,source_finalized_slots:&BTreeSet<u64>,source:&str,epoch:&str,records:&[FilteredIdentity])->Result<PendingRangeReadiness>{
+    for (block,_) in &pending.blocks {let slot:u64=block.slot.parse()?;if !source_finalized_slots.contains(&slot){return Ok(PendingRangeReadiness::AwaitingSourceFinalizedStatus)}}
+    for (block,_) in &pending.blocks {let receipt=reconcile_finalized_block(epoch,source,"1",block.clone(),records,&programs())?;match (receipt.disposition.as_str(),receipt.reason_code.as_deref()) {("MATCHED",None)=>{},("REJECTED",Some("MISSING_FILTERED_IDENTITY"))=>return Ok(PendingRangeReadiness::AwaitingSourceIdentities),_=>bail!("FINALIZED_RANGE_SOURCE_RECONCILIATION_REJECTED:{:?}",receipt.reason_code)}}
+    Ok(PendingRangeReadiness::ReadyToSeal)
+}
+fn seal_pending_finalized_range(root:&PathBuf,source:&str,epoch:&str,pending:&PendingFinalizedRange,source_finalized_slots:&BTreeSet<u64>,records:&[FilteredIdentity],events:&HashMap<String,Vec<RawSemanticEvent>>)->Result<Option<FinalizedSlotInventory>>{
+    if pending_range_readiness(pending,source_finalized_slots,source,epoch,records)?!=PendingRangeReadiness::ReadyToSeal{return Ok(None)}
+    Ok(Some(finalized_slot_inventory_from_mocked_rpc(root,source,epoch,pending.start,pending.end,&pending.get_blocks_response,pending.blocks.clone(),records,events)?))
 }
 fn records(path:&PathBuf,epoch:&str)->Result<Vec<FilteredIdentity>>{ let text=fs::read_to_string(path.join(format!("{epoch}.filtered-identities.jsonl")))?; text.lines().map(|l|serde_json::from_str(l).map_err(Into::into)).collect() }
 
@@ -144,7 +169,7 @@ async fn integrated_main() -> Result<()> {
         let mut updates=client.subscribe(Request::new(stream::once(async{req()}).chain(stream::pending()))).await?.into_inner();
         let http=reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
         let mut dispatcher=Dispatcher::new(32,3,1000)?;
-        let mut finalized_slots=BTreeSet::new(); let mut highest_finalized_slot=None::<u64>; let mut all_records=Vec::<FilteredIdentity>::new(); let mut raw_events=HashMap::<String,Vec<RawSemanticEvent>>::new(); let mut terminal=Vec::<(u64,String)>::new();let mut auto_range_start=None::<u64>;let mut range_inventory_complete=initial_range_inventory_complete(range_slots);
+        let mut finalized_slots=BTreeSet::new(); let mut highest_finalized_slot=None::<u64>; let mut all_records=Vec::<FilteredIdentity>::new(); let mut raw_events=HashMap::<String,Vec<RawSemanticEvent>>::new(); let mut terminal=Vec::<(u64,String)>::new();let mut auto_range_start=None::<u64>;let mut pending_range=None::<PendingFinalizedRange>;let mut range_inventory_complete=initial_range_inventory_complete(range_slots);
         let started=std::time::Instant::now();
         while started.elapsed()<Duration::from_secs(max_seconds) && !range_inventory_complete {
             match tokio::time::timeout(Duration::from_millis(250),updates.next()).await {
@@ -184,10 +209,11 @@ async fn integrated_main() -> Result<()> {
                 dispatcher.result(slot,now_ms(),&disposition)?; persist_state(&root,&source,&dispatcher,&terminal)?;if disposition=="MATCHED" {break}
             }
             for (slot,state) in dispatcher.drain_completed() { let outcome=match state { SlotState::Matched=>"MATCHED", SlotState::Failed=>"FAILED", _=>"INVALID" }.to_owned(); if outcome=="MATCHED" {report.exact_passes+=1; report.slots_reconciled+=1; report.reconciled_slot_produced=true;if range_slots.is_some()&&auto_range_start.is_none(){auto_range_start=Some(slot)}if range_slots.is_none(){range_inventory_complete=true}} else {report.failures+=1; report.slots_rejected+=1;} terminal.push((slot,outcome)); persist_state(&root,&source,&dispatcher,&terminal)?; }
-            if let (Some(start),Some(slots))=(auto_range_start,range_slots){if finalized_range_ready(start,slots,highest_finalized_slot)?{let end=start.checked_add(slots-1).context("FINALIZED_RANGE_OVERFLOW")?;bounded_finalized_slot_inventory(&http,&rpc,&root,&source,"1",start,end,&mut budget,&mut report,&all_records,&raw_events).await?;range_inventory_complete=true;}}
+            if pending_range.is_none(){if let (Some(start),Some(slots))=(auto_range_start,range_slots){if finalized_range_ready(start,slots,highest_finalized_slot)?{let end=start.checked_add(slots-1).context("FINALIZED_RANGE_OVERFLOW")?;pending_range=Some(fetch_pending_finalized_range(&http,&rpc,&root,start,end,&mut budget,&mut report).await?);}}}
+            if let Some(pending)=pending_range.as_ref(){match pending_range_readiness(pending,&finalized_slots,&source,epoch,&all_records)? {PendingRangeReadiness::AwaitingSourceFinalizedStatus=>report.unresolved="WAITING_FOR_SOURCE_FINALIZED_STATUS".into(),PendingRangeReadiness::AwaitingSourceIdentities=>report.unresolved="WAITING_FOR_SOURCE_IDENTITIES".into(),PendingRangeReadiness::ReadyToSeal=>{seal_pending_finalized_range(&root,&source,epoch,pending,&finalized_slots,&all_records,&raw_events)?.context("FINALIZED_RANGE_SEAL_READY_MISSING")?;range_inventory_complete=true;}}}
         }
         if !report.reconciled_slot_produced { bail!("NO_EXACT_FINALIZED_RECONCILIATION_PASS") }
-        if range_slots.is_some()&&!range_inventory_complete {bail!("FINALIZED_RANGE_NOT_REACHED_BEFORE_RUNTIME_CAP")}
+        if range_slots.is_some()&&!range_inventory_complete {if pending_range.is_some(){bail!("FINALIZED_RANGE_SOURCE_EVIDENCE_INCOMPLETE")}bail!("FINALIZED_RANGE_NOT_REACHED_BEFORE_RUNTIME_CAP")}
         // A reconciled block proves only filtered identity coverage for that
         // block. It is deliberately not an eligible-pool universe or a full
         // scientific market interval, so no semantic state is released here.
@@ -206,6 +232,18 @@ async fn main()->Result<()> { integrated_main().await }
 mod integrated_tests {
     use super::*;
 
+    fn pending_block(slot:u64, signatures:&[&str])->(FinalizedBlockInput,Vec<Value>){
+        (FinalizedBlockInput{slot:slot.to_string(),block_identity:format!("block-{slot}"),finalized:true,executed_transaction_count:signatures.len().to_string(),transactions:signatures.iter().enumerate().map(|(index,signature)|FinalizedTransactionInput{transaction_index:index.to_string(),signature:(*signature).into(),account_or_program_ids:vec![PUMP.into()],supported_version:true}).collect()},vec![])
+    }
+    fn pending_fixture()->PendingFinalizedRange{PendingFinalizedRange{start:100,end:104,get_blocks_response:json!({"jsonrpc":"2.0","id":"fixture","result":[100,101,102,103,104]}),blocks:(100..=104).map(|slot|pending_block(slot,&[&format!("sig-{slot}")])).collect()}}
+    fn fixture_records(root:&PathBuf,slots:&[u64])->Vec<FilteredIdentity>{
+        let policy=StoragePolicy{manifest_quota_bytes:1024*1024,protected_free_bytes:0,available_free_bytes:1024*1024*1024,max_in_memory_identities:32};
+        let mut writer=FilteredIdentityManifestWriter::open(root,"epoch","source","1",0,0,policy).unwrap();
+        for slot in slots {writer.append(*slot,&format!("sig-{slot}"),*slot as u128,Some(0),"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();}
+        records(root,"epoch").unwrap()
+    }
+    fn fixture_root(label:&str)->PathBuf{let root=std::env::temp_dir().join(format!("canonical-range-{label}-{}",std::process::id()));let _=fs::remove_dir_all(&root);fs::create_dir_all(&root).unwrap();root}
+
     #[test]
     fn subscription_binds_filtered_transactions_and_explicit_finalized_progress() {
         let request = req();
@@ -214,6 +252,33 @@ mod integrated_tests {
         assert_eq!(request.transactions.get("canonicalRelevant").and_then(|filter| filter.vote), Some(false));
         assert_eq!(request.slots.get("finalizedProgress").and_then(|filter| filter.filter_by_commitment), Some(true));
         assert_eq!(request.slots.get("finalizedProgress").and_then(|filter| filter.interslot_updates), Some(false));
+    }
+
+    #[test]
+    fn fifth_finalized_before_late_source_identities_waits_then_becomes_sealable() {
+        let pending=pending_fixture();let finalized=(100..=104).collect::<BTreeSet<_>>();
+        let incomplete_root=fixture_root("late-before");let incomplete=fixture_records(&incomplete_root,&[100,101,102,103]);
+        assert_eq!(pending_range_readiness(&pending,&finalized,"source","epoch",&incomplete).unwrap(),PendingRangeReadiness::AwaitingSourceIdentities);
+        let complete_root=fixture_root("late-after");let complete=fixture_records(&complete_root,&[100,101,102,103,104]);
+        assert_eq!(pending_range_readiness(&pending,&finalized,"source","epoch",&complete).unwrap(),PendingRangeReadiness::ReadyToSeal);
+        let _=fs::remove_dir_all(incomplete_root);let _=fs::remove_dir_all(complete_root);
+    }
+
+    #[test]
+    fn range_waits_for_each_produced_slot_source_finalized_status_not_a_higher_slot() {
+        let pending=pending_fixture();let records_root=fixture_root("finalized-status");let records=fixture_records(&records_root,&[100,101,102,103,104]);
+        let missing_fifth=(100..=103).collect::<BTreeSet<_>>();
+        assert_eq!(pending_range_readiness(&pending,&missing_fifth,"source","epoch",&records).unwrap(),PendingRangeReadiness::AwaitingSourceFinalizedStatus);
+        let _=fs::remove_dir_all(records_root);
+    }
+
+    #[test]
+    fn missing_fifth_source_evidence_cannot_seal_complete_inventory_and_zero_relevant_remains_valid() {
+        let pending=pending_fixture();let finalized=(100..=104).collect::<BTreeSet<_>>();let root=fixture_root("missing");let records=fixture_records(&root,&[100,101,102,103]);
+        assert_ne!(pending_range_readiness(&pending,&finalized,"source","epoch",&records).unwrap(),PendingRangeReadiness::ReadyToSeal);
+        let zero=PendingFinalizedRange{start:200,end:204,get_blocks_response:json!({"jsonrpc":"2.0","id":"zero","result":[200,201,202,203,204]}),blocks:(200..=204).map(|slot|pending_block(slot,&[])).collect()};
+        assert_eq!(pending_range_readiness(&zero,&(200..=204).collect(),"source","epoch",&[]).unwrap(),PendingRangeReadiness::ReadyToSeal);
+        let _=fs::remove_dir_all(root);
     }
 
     #[test]
