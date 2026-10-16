@@ -51,8 +51,10 @@ pub struct FilteredIdentity {
     pub signature: String,
     pub receive_sequence: String,
     pub received_at_unix_ns: String,
-    /// This is arrival provenance only. It is never an authoritative block
-    /// transaction index and is intentionally excluded from reconciliation.
+    /// Backward-compatible field name for Yellowstone
+    /// `SubscribeUpdateTransactionInfo.index`: the source transaction index
+    /// in its block. Receive sequence and timestamp are the arrival
+    /// provenance. Finalized RPC remains the authoritative ordering source.
     pub observed_arrival_index: Option<String>,
     pub source_frame_sha256: String,
     pub continuity_status: String,
@@ -448,10 +450,12 @@ mod tests {
     fn all_records(root: &Path) -> Vec<FilteredIdentity> { BufReader::new(File::open(root.join("epoch-a.filtered-identities.jsonl")).unwrap()).lines().map(|line| serde_json::from_str(&line.unwrap()).unwrap()).collect() }
 
     #[test]
-    fn complete_interval_reconciles_and_reversed_arrivals_are_not_order() {
+    fn complete_interval_reconciles_when_arrival_is_reverse_of_block_order() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
-        out.append(10, "sig-10-2", 30, Some(999), "raw-2").unwrap();
-        out.append(10, "sig-10-0", 31, Some(2), "raw-0").unwrap();
+        // Receive order is deliberately reversed. Source transaction indexes
+        // remain the valid block indexes; neither drives finalized ordering.
+        out.append(10, "sig-10-2", 30, Some(2), "raw-2").unwrap();
+        out.append(10, "sig-10-0", 31, Some(0), "raw-0").unwrap();
         let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0", "sig-10-2"]), &all_records(root.path()), &programs()).unwrap();
         assert_eq!(receipt.disposition, "MATCHED");
     }
