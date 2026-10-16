@@ -16,6 +16,7 @@ pub mod block_order_verifier_v1;
 pub mod filtered_identity_manifest_v1;
 pub mod pump_instruction_path_decoder_v1;
 pub mod pool_universe_bootstrap_v1;
+pub mod forward_new_pool_cohort_v1;
 
 pub const SCHEMA_VERSION: &str = "PUMP_EXACT_EVIDENCE_LEDGER_V1";
 pub const FRAME_MAGIC: &[u8; 8] = b"PEL1FRM\0";
