@@ -32,7 +32,7 @@ const PROTECTED_RESERVE: u64 = 160 * 1024 * 1024 * 1024;
 struct DiagnosticRpcReservation { range_slots:u64, inventory_requests:u64, dispatcher_limit:u64 }
 
 #[derive(Serialize)] #[serde(rename_all="camelCase")]
-struct Report { schema:String, status:String, started_at_utc:String, finished_at_utc:String, slots_observed:usize, slots_reconciled:usize, slots_rejected:usize, exact_passes:usize, failures:usize, rpc_calls:u64, retries:u64, pending_slot_peak:usize, max_rss_bytes:u64, max_message_bytes:usize, disk_growth_bytes:u64, decoder_transactions:u64, decoder_events:u64, decoder_rejections:u64, source_gap_or_epoch_failure:bool, unresolved:String, reconciled_slot_produced:bool, scientific_interval_produced:bool, failure:Option<String> }
+struct Report { schema:String, status:String, started_at_utc:String, finished_at_utc:String, slots_observed:usize, slots_reconciled:usize, slots_rejected:usize, exact_passes:usize, failures:usize, rpc_calls:u64, dispatcher_rpc_calls:u64, dispatcher_retry_rpc_calls:u64, inventory_get_blocks_rpc_calls:u64, inventory_get_block_rpc_calls:u64, retries:u64, pending_slot_peak:usize, max_rss_bytes:u64, max_message_bytes:usize, disk_growth_bytes:u64, decoder_transactions:u64, decoder_events:u64, decoder_rejections:u64, source_gap_or_epoch_failure:bool, unresolved:String, reconciled_slot_produced:bool, scientific_interval_produced:bool, failure:Option<String> }
 
 fn free(path:&PathBuf)->Result<u64>{ let out=Command::new("df").args(["-B1","--output=avail",path.to_str().context("PATH")?]).output()?; Ok(String::from_utf8(out.stdout)?.lines().nth(1).context("DF")?.trim().parse()?) }
 fn rss()->u64 { fs::read_to_string("/proc/self/status").ok().and_then(|s|s.lines().find_map(|l|l.strip_prefix("VmHWM:")?.split_whitespace().next()?.parse::<u64>().ok())).unwrap_or(0)*1024 }
@@ -42,6 +42,9 @@ fn diagnostic_rpc_reservation(budget:&RpcBudget,start:u64,end:u64)->Result<Diagn
 fn consume_dispatcher_rpc(budget:&mut RpcBudget,reservation:Option<DiagnosticRpcReservation>)->Result<()> {if let Some(reservation)=reservation {if budget.used_requests()>=reservation.dispatcher_limit{bail!("DISPATCHER_RPC_RESERVATION_EXHAUSTED")}}budget.consume_one()}
 fn parse_diagnostic_range_slots(value:Option<&str>)->Result<Option<u64>> { let Some(value)=value else{return Ok(None)};let slots:u64=value.parse().context("FINALIZED_RANGE_SLOT_COUNT")?;if !(3..=5).contains(&slots){bail!("FINALIZED_RANGE_SLOT_COUNT_OUT_OF_BOUNDS")}Ok(Some(slots)) }
 fn finalized_range_ready(start:u64,slots:u64,highest_finalized_slot:Option<u64>)->Result<bool>{let end=start.checked_add(slots.checked_sub(1).context("FINALIZED_RANGE_INVALID")?).context("FINALIZED_RANGE_OVERFLOW")?;Ok(highest_finalized_slot.is_some_and(|highest|highest>=end))}
+// Both diagnostic modes start collecting. Range mode completes only after its
+// inventory seals; no-range mode completes after one exact dispatcher match.
+fn initial_range_inventory_complete(_:Option<u64>)->bool { false }
 fn req()->SubscribeRequest { let mut transactions=HashMap::new(); let mut slots=HashMap::new(); transactions.insert("canonicalRelevant".into(), SubscribeRequestFilterTransactions { vote:Some(false), failed:Some(false), signature:None, account_include:vec![PUMP.into(),ROUTER.into(),PUMPSWAP_PROGRAM.into()], account_exclude:vec![], account_required:vec![], token_accounts:None }); slots.insert("finalizedProgress".into(), SubscribeRequestFilterSlots { filter_by_commitment:Some(true), interslot_updates:Some(false) }); SubscribeRequest { accounts:HashMap::new(), slots, transactions, transactions_status:HashMap::new(), blocks:HashMap::new(), blocks_meta:HashMap::new(), entry:HashMap::new(), accounts_data_slice:vec![], commitment:Some(CommitmentLevel::Finalized as i32), ping:None, from_slot:None } }
 fn programs()->BTreeSet<String>{ [PUMP.to_owned(),ROUTER.to_owned(),PUMPSWAP_PROGRAM.to_owned()].into_iter().collect() }
 fn relevant(tx:&Value)->Result<FinalizedTransactionInput>{ let signature=tx.pointer("/transaction/signatures/0").and_then(Value::as_str).context("RPC_SIGNATURE")?.to_owned(); let mut ids=BTreeSet::new(); for key in tx.pointer("/transaction/message/accountKeys").and_then(Value::as_array).context("RPC_KEYS")? { if let Some(s)=key.as_str(){ids.insert(s.to_owned());} else if let Some(s)=key.get("pubkey").and_then(Value::as_str){ids.insert(s.to_owned());} else {bail!("RPC_KEY_LAYOUT")} } for p in ["/meta/loadedAddresses/writable","/meta/loadedAddresses/readonly"] { if let Some(keys)=tx.pointer(p).and_then(Value::as_array){ for key in keys { ids.insert(key.as_str().context("RPC_LOADED_KEY")?.to_owned()); } } } let failed = tx.pointer("/meta/err").map(|v| !v.is_null()).unwrap_or(true); if failed { ids.clear(); } let supported_version = match tx.get("version") { None => true, Some(value) if value.as_str()==Some("legacy") => true, Some(value) => value.as_u64().is_some_and(|version| version <= 1) }; Ok(FinalizedTransactionInput { transaction_index:String::new(), signature, account_or_program_ids:ids.into_iter().collect(), supported_version }) }
@@ -75,14 +78,14 @@ fn finalized_slot_inventory_from_mocked_rpc(root:&PathBuf,source:&str,epoch:&str
     // all EdgeSniffer receipts below are separately JCS-bound.
     let response_bytes=serde_json::to_vec(get_blocks_response)?;let response_sha=pump_exact_evidence_ledger::sha256_hex(&response_bytes);let tmp=root.join(".finalized-getblocks-response.tmp");fs::write(&tmp,response_bytes)?;fs::rename(tmp,root.join("finalized-getblocks-response.json"))?;let mut blocks_by_slot=BTreeMap::new();for(block,transactions)in blocks{let slot:u64=block.slot.parse()?;if blocks_by_slot.insert(slot,(block,transactions)).is_some(){bail!("FINALIZED_RANGE_DUPLICATE_BLOCK_RESPONSE")}}let mut proofs=Vec::new();for slot in &produced{let(proof,transactions)=blocks_by_slot.remove(slot).context("FINALIZED_RANGE_BLOCK_RESPONSE_MISSING")?;let receipt=reconcile_finalized_block(epoch,source,"1",proof.clone(),records,&programs())?;if receipt.disposition!="MATCHED"||receipt.reason_code.is_some(){bail!("FINALIZED_RANGE_RECONCILIATION_INCOMPLETE")}let bundle=producer_slot_bundle(source,epoch,receipt,&transactions,events)?;bundle.write_atomic(root)?;proofs.push(ReconciledProducedSlot{slot:slot.to_string(),block_identity:proof.block_identity,slot_reconciliation_receipt_sha256:bundle.reconciliation.receipt_sha256.clone()});}if !blocks_by_slot.is_empty(){bail!("FINALIZED_RANGE_UNEXPECTED_BLOCK_RESPONSE")}let inventory=FinalizedSlotInventory::seal(source,"1",start,end,&response_sha,&produced,proofs)?;inventory.write_atomic(root)?;Ok(inventory)
 }
-async fn bounded_finalized_slot_inventory(http:&reqwest::Client,url:&str,root:&PathBuf,source:&str,epoch:&str,start:u64,end:u64,budget:&mut RpcBudget,records:&[FilteredIdentity],events:&HashMap<String,Vec<RawSemanticEvent>>)->Result<FinalizedSlotInventory>{
-    diagnostic_range_preflight(budget,start,end)?; budget.consume_one()?;
+async fn bounded_finalized_slot_inventory(http:&reqwest::Client,url:&str,root:&PathBuf,source:&str,epoch:&str,start:u64,end:u64,budget:&mut RpcBudget,report:&mut Report,records:&[FilteredIdentity],events:&HashMap<String,Vec<RawSemanticEvent>>)->Result<FinalizedSlotInventory>{
+    diagnostic_range_preflight(budget,start,end)?; budget.consume_one()?; report.inventory_get_blocks_rpc_calls+=1;
     let response:Value=http.post(url).json(&json!({"jsonrpc":"2.0","id":"bounded-finalized-slot-inventory","method":"getBlocks","params":[start,end,{"commitment":"finalized"}]})).send().await?.error_for_status()?.json().await?;
     if response.get("error").is_some(){bail!("GET_BLOCKS_RPC_ERROR")}
     let result=response.get("result").and_then(Value::as_array).context("GET_BLOCKS_RESULT")?;
     let produced=result.len();
     if budget.used_requests().saturating_add(produced as u64)>budget.maximum_requests {bail!("FINALIZED_RANGE_RPC_BUDGET_INSUFFICIENT")}
-    let mut blocks=Vec::new();for value in result {let slot=value.as_u64().context("GET_BLOCKS_SLOT")?;budget.consume_one()?;blocks.push(block(http,url,slot).await?)}
+    let mut blocks=Vec::new();for value in result {let slot=value.as_u64().context("GET_BLOCKS_SLOT")?;budget.consume_one()?;report.inventory_get_block_rpc_calls+=1;blocks.push(block(http,url,slot).await?)}
     finalized_slot_inventory_from_mocked_rpc(root,source,epoch,start,end,&response,blocks,records,events)
 }
 fn records(path:&PathBuf,epoch:&str)->Result<Vec<FilteredIdentity>>{ let text=fs::read_to_string(path.join(format!("{epoch}.filtered-identities.jsonl")))?; text.lines().map(|l|serde_json::from_str(l).map_err(Into::into)).collect() }
@@ -119,7 +122,8 @@ async fn integrated_main() -> Result<()> {
     let max_seconds: u64=env::var("CANONICAL_CANARY_MAX_SECONDS").unwrap_or_else(|_|(45_u64*60).to_string()).parse()?;
     if env::var_os("FINALIZED_RANGE_START_SLOT").is_some()||env::var_os("FINALIZED_RANGE_END_SLOT").is_some(){bail!("FINALIZED_RANGE_STATIC_BOUNDARY_UNSAFE")}
     let range_slots=parse_diagnostic_range_slots(env::var("FINALIZED_RANGE_SLOT_COUNT").ok().as_deref())?;
-    let reservation=range_slots.map(|slots|diagnostic_rpc_reservation(&RpcBudget::new(16,1,1000)?,0,slots-1)).transpose()?;
+    let mut budget=RpcBudget::new(16,1,1000)?;
+    let reservation=range_slots.map(|slots|diagnostic_rpc_reservation(&budget,0,slots-1)).transpose()?;
     fs::create_dir_all(&root)?;
     let start_free=free(&root)?;
     validate_storage_policy(start_free,reserve,start_floor,total_cap)?;
@@ -130,7 +134,7 @@ async fn integrated_main() -> Result<()> {
     let epoch="canary-epoch-1";
     let run_binding=serde_json::json!({"schema":"CANONICAL_FINALIZED_CANARY_BINDING_V1","sourceInstanceId":source,"continuityEpoch":"1","startupFreeBytes":start_free.to_string(),"startupFloorBytes":start_floor.to_string(),"runtimeReserveBytes":reserve.to_string(),"totalOutputCapBytes":total_cap.to_string()});
     fs::write(root.join("run-binding.json"),serde_json::to_vec_pretty(&run_binding)?)?;
-    let mut report=Report{schema:"CANONICAL_FINALIZED_RPC_RECONCILIATION_CANARY_V1".into(),status:"RUNNING".into(),started_at_utc:Utc::now().to_rfc3339(),finished_at_utc:String::new(),slots_observed:0,slots_reconciled:0,slots_rejected:0,exact_passes:0,failures:0,rpc_calls:0,retries:0,pending_slot_peak:0,max_rss_bytes:0,max_message_bytes:0,disk_growth_bytes:0,decoder_transactions:0,decoder_events:0,decoder_rejections:0,source_gap_or_epoch_failure:false,unresolved:"NONE".into(),reconciled_slot_produced:false,scientific_interval_produced:false,failure:None};
+    let mut report=Report{schema:"CANONICAL_FINALIZED_RPC_RECONCILIATION_CANARY_V1".into(),status:"RUNNING".into(),started_at_utc:Utc::now().to_rfc3339(),finished_at_utc:String::new(),slots_observed:0,slots_reconciled:0,slots_rejected:0,exact_passes:0,failures:0,rpc_calls:0,dispatcher_rpc_calls:0,dispatcher_retry_rpc_calls:0,inventory_get_blocks_rpc_calls:0,inventory_get_block_rpc_calls:0,retries:0,pending_slot_peak:0,max_rss_bytes:0,max_message_bytes:0,disk_growth_bytes:0,decoder_transactions:0,decoder_events:0,decoder_rejections:0,source_gap_or_epoch_failure:false,unresolved:"NONE".into(),reconciled_slot_produced:false,scientific_interval_produced:false,failure:None};
     let result:Result<()> = async {
         let policy=StoragePolicy{manifest_quota_bytes:MANIFEST_QUOTA,protected_free_bytes:reserve,available_free_bytes:start_free,max_in_memory_identities:16384};
         let mut manifest=FilteredIdentityManifestWriter::open(&root,epoch,&source,"1",0,0,policy)?;
@@ -139,9 +143,8 @@ async fn integrated_main() -> Result<()> {
         let mut client=GeyserClient::with_interceptor(channel,move|mut r:Request<()>|{r.metadata_mut().insert("x-token",t.clone());Ok::<_,Status>(r)}).max_decoding_message_size(MAX_MESSAGE);
         let mut updates=client.subscribe(Request::new(stream::once(async{req()}).chain(stream::pending()))).await?.into_inner();
         let http=reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
-        let mut budget=RpcBudget::new(16,1,1000)?;
         let mut dispatcher=Dispatcher::new(32,3,1000)?;
-        let mut finalized_slots=BTreeSet::new(); let mut highest_finalized_slot=None::<u64>; let mut all_records=Vec::<FilteredIdentity>::new(); let mut raw_events=HashMap::<String,Vec<RawSemanticEvent>>::new(); let mut terminal=Vec::<(u64,String)>::new();let mut auto_range_start=None::<u64>;let mut range_inventory_complete=range_slots.is_none();
+        let mut finalized_slots=BTreeSet::new(); let mut highest_finalized_slot=None::<u64>; let mut all_records=Vec::<FilteredIdentity>::new(); let mut raw_events=HashMap::<String,Vec<RawSemanticEvent>>::new(); let mut terminal=Vec::<(u64,String)>::new();let mut auto_range_start=None::<u64>;let mut range_inventory_complete=initial_range_inventory_complete(range_slots);
         let started=std::time::Instant::now();
         while started.elapsed()<Duration::from_secs(max_seconds) && !range_inventory_complete {
             match tokio::time::timeout(Duration::from_millis(250),updates.next()).await {
@@ -170,7 +173,8 @@ async fn integrated_main() -> Result<()> {
             }
             report.pending_slot_peak=report.pending_slot_peak.max(dispatcher.active());
             while auto_range_start.is_none() && !range_inventory_complete { let Some(slot)=dispatcher.due(now_ms()) else {break};
-                consume_dispatcher_rpc(&mut budget,reservation)?; report.rpc_calls+=1;
+                let retry_attempt=dispatcher.slots.get(&slot).is_some_and(|work|work.attempts>0);
+                consume_dispatcher_rpc(&mut budget,reservation)?; report.dispatcher_rpc_calls+=1;if retry_attempt{report.dispatcher_retry_rpc_calls+=1;}
                 let disposition=match block(&http,&rpc,slot).await {
                     Ok((proof,transactions)) => { let receipt=reconcile_finalized_block(epoch,&source,"1",proof,&all_records,&programs())?; if receipt.disposition=="MATCHED" { let bundle=producer_slot_bundle(&source,"1",receipt,&transactions,&raw_events)?;bundle.write_atomic(&root)?;"MATCHED".to_owned() } else { report.unresolved=receipt.reason_code.unwrap_or_else(||"RECONCILIATION_REJECTED".into()); report.unresolved.clone() } }
                     Err(error) if error.to_string().contains("RPC_BLOCK_UNAVAILABLE") => "RPC_NOT_FINALIZED".to_owned(),
@@ -180,7 +184,7 @@ async fn integrated_main() -> Result<()> {
                 dispatcher.result(slot,now_ms(),&disposition)?; persist_state(&root,&source,&dispatcher,&terminal)?;if disposition=="MATCHED" {break}
             }
             for (slot,state) in dispatcher.drain_completed() { let outcome=match state { SlotState::Matched=>"MATCHED", SlotState::Failed=>"FAILED", _=>"INVALID" }.to_owned(); if outcome=="MATCHED" {report.exact_passes+=1; report.slots_reconciled+=1; report.reconciled_slot_produced=true;if range_slots.is_some()&&auto_range_start.is_none(){auto_range_start=Some(slot)}if range_slots.is_none(){range_inventory_complete=true}} else {report.failures+=1; report.slots_rejected+=1;} terminal.push((slot,outcome)); persist_state(&root,&source,&dispatcher,&terminal)?; }
-            if let (Some(start),Some(slots))=(auto_range_start,range_slots){if finalized_range_ready(start,slots,highest_finalized_slot)?{let end=start.checked_add(slots-1).context("FINALIZED_RANGE_OVERFLOW")?;bounded_finalized_slot_inventory(&http,&rpc,&root,&source,"1",start,end,&mut budget,&all_records,&raw_events).await?;range_inventory_complete=true;}}
+            if let (Some(start),Some(slots))=(auto_range_start,range_slots){if finalized_range_ready(start,slots,highest_finalized_slot)?{let end=start.checked_add(slots-1).context("FINALIZED_RANGE_OVERFLOW")?;bounded_finalized_slot_inventory(&http,&rpc,&root,&source,"1",start,end,&mut budget,&mut report,&all_records,&raw_events).await?;range_inventory_complete=true;}}
         }
         if !report.reconciled_slot_produced { bail!("NO_EXACT_FINALIZED_RECONCILIATION_PASS") }
         if range_slots.is_some()&&!range_inventory_complete {bail!("FINALIZED_RANGE_NOT_REACHED_BEFORE_RUNTIME_CAP")}
@@ -189,7 +193,7 @@ async fn integrated_main() -> Result<()> {
         // scientific market interval, so no semantic state is released here.
         Ok(())
     }.await;
-    report.slots_observed=all_manifest_slot_count(&root, epoch).unwrap_or(0); report.finished_at_utc=Utc::now().to_rfc3339(); report.max_rss_bytes=report.max_rss_bytes.max(rss()); report.disk_growth_bytes=start_free.saturating_sub(free(&root)?);
+    report.rpc_calls=budget.used_requests();report.slots_observed=all_manifest_slot_count(&root, epoch).unwrap_or(0); report.finished_at_utc=Utc::now().to_rfc3339(); report.max_rss_bytes=report.max_rss_bytes.max(rss()); report.disk_growth_bytes=start_free.saturating_sub(free(&root)?);
     match &result { Ok(_)=>report.status="FALLBACK_CANARY_VERIFIED".into(), Err(error)=>{report.status="FALLBACK_CANARY_FAILED_OR_BLOCKED".into();report.failure=Some(error.to_string())} }
     fs::write(root.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
     result
@@ -239,6 +243,9 @@ mod integrated_tests {
         assert_eq!(budget.used_requests(),10);
         assert!(consume_dispatcher_rpc(&mut budget,Some(reservation)).is_err());
         assert!(diagnostic_range_preflight(&budget,100,104).is_ok());
+        for _ in 0..reservation.inventory_requests { budget.consume_one().unwrap(); }
+        assert_eq!(budget.used_requests(),16);
+        assert!(budget.consume_one().is_err());
     }
 
     #[test]
@@ -250,6 +257,14 @@ mod integrated_tests {
         for (now,result) in [(0,"RPC_NOT_FINALIZED"),(1,"RPC_NOT_FINALIZED"),(3,"MATCHED")] {assert_eq!(dispatcher.due(now),Some(200));consume_dispatcher_rpc(&mut budget,Some(reservation)).unwrap();dispatcher.result(200,now,result).unwrap();}
         assert_eq!(budget.used_requests(),3);
         assert!(diagnostic_range_preflight(&budget,200,204).is_ok());
+        for _ in 0..reservation.inventory_requests { budget.consume_one().unwrap(); }
+        assert_eq!(budget.used_requests(),9);
+    }
+
+    #[test]
+    fn no_range_mode_enters_the_original_single_slot_collection_loop() {
+        assert!(!initial_range_inventory_complete(None));
+        assert!(!initial_range_inventory_complete(Some(5)));
     }
 
     #[test]
