@@ -2,7 +2,7 @@
 Description=EdgeSniffer kEFi Canonical State V1 bounded capture-only canary
 After=network-online.target
 Wants=network-online.target
-RequiresMountsFor=/mnt/edgesniffer-kefi-hot
+RequiresMountsFor=/mnt/edgesniffer-canonical-hot
 
 [Service]
 Type=simple
@@ -10,15 +10,15 @@ User=root
 EnvironmentFile=/etc/edgesniffer/kefi-full-meta.env
 EnvironmentFile=/etc/edgesniffer/kefi-choice-state-observer-v1-live.env
 Environment=YELLOWSTONE_FULL_META_ENDPOINT=https://grpc.fra.shyft.to
-Environment=CANONICAL_CANARY_ROOT=/mnt/edgesniffer-kefi-hot/canonical-state-v1-canary-20261014T233200Z
+Environment=CANONICAL_CANARY_ROOT=/mnt/edgesniffer-canonical-hot/canonical-state-v1-canary-next
 Environment=CANONICAL_CANARY_RAW_CAP_BYTES=4294967296
 Environment=CANONICAL_CANARY_TOTAL_CAP_BYTES=6442450944
 Environment=CANONICAL_CANARY_PROTECTED_RESERVE_BYTES=171798691840
 Environment=CANONICAL_CANARY_START_FLOOR_BYTES=194347270144
 Environment=CANONICAL_CANARY_MAX_SECONDS=2700
 Environment=CANONICAL_CANARY_FIXTURE_TTL_SECONDS=86400
-ExecStartPre=/usr/bin/mountpoint -q /mnt/edgesniffer-kefi-hot
-ExecStartPre=/bin/sh -c 'test "$(findmnt -no SOURCE --target /mnt/edgesniffer-kefi-hot)" = "/dev/vdc1"'
+ExecStartPre=/usr/bin/mountpoint -q /mnt/edgesniffer-canonical-hot
+ExecStartPre=/bin/sh -c 'test "$(findmnt -no SOURCE --target /mnt/edgesniffer-canonical-hot)" = "/dev/vdd1"'
 ExecStart=/usr/local/lib/edgesniffer/edgesniffer-kefi-canonical-canary-v1
 Restart=no
 RuntimeMaxSec=48m
