@@ -19,9 +19,9 @@ use yellowstone_grpc_proto::geyser::{geyser_client::GeyserClient, subscribe_upda
 pub const PUMPSWAP_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const BUY_DISC: &[u8] = &[102, 6, 61, 18, 1, 218, 235, 234];
-const BUY_EXACT_DISC: &[u8] = &[198, 46, 21, 82, 180, 217, 232, 112];
-const SELL_DISC: &[u8] = &[51, 230, 133, 164, 1, 127, 131, 173];
+pub const BUY_DISC: &[u8] = &[102, 6, 61, 18, 1, 218, 235, 234];
+pub const BUY_EXACT_DISC: &[u8] = &[198, 46, 21, 82, 180, 217, 232, 112];
+pub const SELL_DISC: &[u8] = &[51, 230, 133, 164, 1, 127, 131, 173];
 const BUY_EVENT_DISC: &[u8] = &[103, 244, 82, 31, 44, 245, 119, 119];
 const SELL_EVENT_DISC: &[u8] = &[62, 47, 55, 10, 165, 3, 220, 42];
 const SCHEMA: &str = "KEFI_TEACHER_INDEPENDENT_POOL_STATE_V1";
@@ -39,6 +39,7 @@ const PUMPSWAP_MIN_BUY_ACCOUNTS: usize = 23;
 const PUMPSWAP_MIN_SELL_ACCOUNTS: usize = 21;
 const CHOICESTATE_WARMUP_SECONDS: u64 = 60;
 
+#[derive(Clone, Debug)]
 pub struct Event {
     pub side: &'static str, pub base_amount: u64, pub pool_base: u64, pub pool_quote: u64, pub pool_quote_delta: u64,
     pub lp_fee_bps: u64, pub protocol_fee_bps: u64, pub coin_creator_bps: u64, pub cashback_bps: u64, pub buyback_bps: u64,
