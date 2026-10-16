@@ -13,10 +13,16 @@ source identity set. A late source identity waits without another finalized RPC
 attempt. A source miss reaches an explicit inconclusive disposition instead of a
 false sealed inventory.
 
-Release candidate:
+Superseded release candidate (retained for provenance):
 
 ```text
 cde3693cc6ecd3bd290bc721e3f1ac4da1e7bc3e97a04ce6c4e46aa6a88ccf04
+```
+
+Current repaired offline release candidate:
+
+```text
+54d897f54fb4cb8dc2392da16227cfdd3da2cd5e8e9b051d385b9a20eada36cc
 ```
 
 Artifact path, not installed:
@@ -84,10 +90,13 @@ target on `/mnt/edgesniffer-canonical-hot`:
 
 ```text
 rust-exact-ledger: cargo test --lib --quiet
-53 passed; 0 failed
+54 passed; 0 failed
+
+rust-sidecar: cargo test --lib --quiet
+108 passed; 0 failed
 
 rust-sidecar: cargo test --bin kefi_finalized_rpc_reconciliation_canary_v1 --quiet
-21 passed; 0 failed
+23 passed; 0 failed
 
 rust-sidecar: cargo build --release --bin kefi_finalized_rpc_reconciliation_canary_v1 --quiet
 success; SHA-256 above

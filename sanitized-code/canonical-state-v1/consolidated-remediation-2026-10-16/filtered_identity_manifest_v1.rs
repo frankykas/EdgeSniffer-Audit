@@ -458,8 +458,12 @@ pub fn reconcile_finalized_block_with_policy(epoch_id: &str, source_instance_id:
     for transaction in block.transactions {
         let index: usize = transaction.transaction_index.parse().context("BLOCK_TRANSACTION_INDEX_INVALID")?;
         if index >= expected || !seen_indexes.insert(index) || !seen_signatures.insert(transaction.signature.clone()) { bail!("BLOCK_ORDER_OR_IDENTITY_CONFLICT") }
-        transaction.require_supported_version()?;
-        if policy.supports_and_matches(&transaction)? {
+        // Transaction-version support is only a scientific obligation for a
+        // transaction matching the frozen Pump/PumpSwap program predicate.
+        // An unrelated future-version transaction must not poison a bounded
+        // filtered relevance proof.
+        if policy.matches_program_ids(&transaction)? {
+            transaction.require_supported_version()?;
             if block_relevant.insert((block.slot.clone(), transaction.signature), index).is_some() {
                 bail!("BLOCK_RELEVANT_DUPLICATE_IDENTITY")
             }

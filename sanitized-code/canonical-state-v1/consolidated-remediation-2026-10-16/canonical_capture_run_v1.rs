@@ -135,7 +135,10 @@ impl CanonicalRelevancePolicy {
     }
     pub fn supports_and_matches(&self, transaction: &FinalizedTransactionInput) -> Result<bool> {
         self.validate()?;
-        if !transaction.supported_version { return Ok(false) }
+        Ok(transaction.supported_version && self.matches_program_ids(transaction)?)
+    }
+    pub fn matches_program_ids(&self, transaction: &FinalizedTransactionInput) -> Result<bool> {
+        self.validate()?;
         Ok(transaction.account_or_program_ids.iter().any(|id| self.program_ids.binary_search(id).is_ok()))
     }
 }
@@ -242,7 +245,7 @@ impl CaptureRunJournal {
     }
     pub fn source_match_complete(&self, observed:&BTreeSet<ExpectedIdentity>) -> Result<bool> { if self.checkpoint.lifecycle!=CaptureLifecycle::AwaitingSourceMatch {bail!("SOURCE_MATCH_OUTSIDE_AWAITING")}let expected=self.checkpoint.expected_identities.iter().cloned().collect::<BTreeSet<_>>();Ok(expected==*observed) }
     pub fn stage_receipts(&mut self)->Result<()> { if self.checkpoint.lifecycle!=CaptureLifecycle::AwaitingSourceMatch {bail!("RECEIPT_STAGE_INVALID")}self.checkpoint.receipt_state="STAGED".into();self.transition(CaptureLifecycle::ReceiptsStaged) }
-    pub fn commit_receipts(&mut self)->Result<()> { if self.checkpoint.lifecycle!=CaptureLifecycle::ReceiptsStaged {bail!("RECEIPT_COMMIT_INVALID")}self.checkpoint.receipt_state="COMMITTED".into();self.transition(CaptureLifecycle::ReceiptsCommitted)?;self.transition(CaptureLifecycle::VerifiedDiagnostic) }
+    pub fn commit_receipts(&mut self)->Result<()> { if self.checkpoint.lifecycle!=CaptureLifecycle::ReceiptsStaged {bail!("RECEIPT_COMMIT_INVALID")}self.checkpoint.receipt_state="COMMITTED".into();self.transition(CaptureLifecycle::ReceiptsCommitted)?;self.checkpoint.terminal_reason=Some("VERIFIED_DIAGNOSTIC_RECEIPTS_COMMITTED".into());self.transition(CaptureLifecycle::VerifiedDiagnostic) }
     pub fn terminal(&mut self, lifecycle:CaptureLifecycle, reason:&str)->Result<()> { if !matches!(lifecycle,CaptureLifecycle::Inconclusive|CaptureLifecycle::Quarantined|CaptureLifecycle::Voided)||reason.is_empty(){bail!("CAPTURE_RUN_TERMINAL_INVALID")}self.checkpoint.terminal_reason=Some(reason.into());self.transition(lifecycle) }
     pub fn void_existing(root:&Path, reason:&str)->Result<()> { let mut journal=Self::load(root)?; if !journal.checkpoint.lifecycle.terminal(){journal.terminal(CaptureLifecycle::Voided,reason)?;}Ok(()) }
     pub fn root(&self)->&Path {&self.root}
@@ -259,4 +262,10 @@ mod tests {
     #[test] fn delayed_identity_is_awaited_without_consuming_another_rpc(){let root=root("late");let mut run=CaptureRunJournal::new(&root,"run","source","1",&policy(),resources()).unwrap();for slot in 10..15{run.observe_finality(finality(slot)).unwrap();}run.select_range(5).unwrap();let expected=(10..15).map(|slot|ExpectedIdentity{slot:slot.to_string(),signature:format!("sig-{slot}"),transaction_index:"0".into()}).collect();let evidence=vec![RawRpcEvidence::new("getBlocks",None,"raw.json",b"{}").unwrap()];run.record_inventory("b".repeat(64).as_str(),expected,evidence).unwrap();let mut observed=BTreeSet::new();for slot in 10..14{observed.insert(ExpectedIdentity{slot:slot.to_string(),signature:format!("sig-{slot}"),transaction_index:"0".into()});}assert!(!run.source_match_complete(&observed).unwrap());assert_eq!(run.checkpoint.resources.rpc_used,"0");observed.insert(ExpectedIdentity{slot:"14".into(),signature:"sig-14".into(),transaction_index:"0".into()});assert!(run.source_match_complete(&observed).unwrap());}
     #[test] fn crash_is_explicitly_voidable_and_never_bridged(){let root=root("void");let _=CaptureRunJournal::new(&root,"run","source","1",&policy(),resources()).unwrap();CaptureRunJournal::void_existing(&root,"PROCESS_CRASH").unwrap();assert_eq!(CaptureRunJournal::load(&root).unwrap().checkpoint.lifecycle,CaptureLifecycle::Voided);}
     #[test] fn policy_is_single_supported_relevance_rule(){let p=policy();let tx=FinalizedTransactionInput{transaction_index:"0".into(),signature:"s".into(),account_or_program_ids:vec!["pump".into()],supported_version:true};assert!(p.supports_and_matches(&tx).unwrap());let failed=FinalizedTransactionInput{supported_version:false,..tx};assert!(!p.supports_and_matches(&failed).unwrap());}
+    #[test] fn every_terminal_checkpoint_reloads_after_atomic_transition(){
+        for (label, terminal) in [("inconclusive",CaptureLifecycle::Inconclusive),("quarantined",CaptureLifecycle::Quarantined),("voided",CaptureLifecycle::Voided)] {
+            let root=root(label);let mut run=CaptureRunJournal::new(&root,"run","source","1",&policy(),resources()).unwrap();run.terminal(terminal.clone(),"TEST_TERMINAL").unwrap();assert_eq!(CaptureRunJournal::load(&root).unwrap().checkpoint.lifecycle,terminal);
+        }
+        let root=root("verified");let mut run=CaptureRunJournal::new(&root,"run","source","1",&policy(),resources()).unwrap();for slot in 10..13{run.observe_finality(finality(slot)).unwrap();}run.select_range(3).unwrap();run.record_inventory(&"b".repeat(64),vec![],vec![RawRpcEvidence::new("getBlocks",None,"raw.json",b"{}").unwrap()]).unwrap();run.stage_receipts().unwrap();run.commit_receipts().unwrap();let reloaded=CaptureRunJournal::load(&root).unwrap();assert_eq!(reloaded.checkpoint.lifecycle,CaptureLifecycle::VerifiedDiagnostic);assert_eq!(reloaded.checkpoint.terminal_reason.as_deref(),Some("VERIFIED_DIAGNOSTIC_RECEIPTS_COMMITTED"));
+    }
 }
