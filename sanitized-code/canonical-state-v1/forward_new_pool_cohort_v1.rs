@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, path::Path};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{canonical_state_v1::hash_excluding_field, finalized_slot_inventory_v1::FinalizedSlotInventory, forward_cohort_receipts_v1::{CreationReceipt, SlotReceiptBundle}};
+use crate::{canonical_capture_run_v1::{CaptureLifecycle, CaptureRunJournal, ExpectedIdentity}, canonical_state_v1::hash_excluding_field, finalized_slot_inventory_v1::FinalizedSlotInventory, forward_cohort_receipts_v1::{CreationReceipt, SlotReceiptBundle}, source_block_closure_v1::SourceBlockClosure};
 
 pub const FORWARD_COHORT_SCHEMA: &str = "CANONICAL_FORWARD_NEW_POOL_COHORT_V3";
 
@@ -22,7 +22,7 @@ fn digest(value:&str,label:&str)->Result<()> {if value.len()!=64||!value.bytes()
 pub fn seal_forward_cohort_from_persisted_receipts(root:&Path,cohort_id:&str,boundary_slot:u64,inventory:&FinalizedSlotInventory)->Result<ForwardCohortLedger>{
     inventory.validate()?;
     let mut bundles=Vec::new();
-    for entry in &inventory.entries { if entry.disposition=="PRODUCED_RECONCILED" { let slot=number(&entry.slot,"INVENTORY_SLOT")?;let bundle=SlotReceiptBundle::read(root,slot)?; if entry.block_identity.as_deref()!=Some(bundle.reconciliation.block_identity.as_str())||entry.slot_reconciliation_receipt_sha256.as_deref()!=Some(bundle.reconciliation.receipt_sha256.as_str()){bail!("PERSISTED_SLOT_INVENTORY_BINDING_INVALID")}bundles.push(bundle) } }
+    for entry in &inventory.entries { if entry.disposition=="PRODUCED_RECONCILED" { let slot=number(&entry.slot,"INVENTORY_SLOT")?;let bundle=SlotReceiptBundle::read(root,slot)?; if entry.block_identity.as_deref()!=Some(bundle.reconciliation.block_identity.as_str())||entry.slot_reconciliation_receipt_sha256.as_deref()!=Some(bundle.reconciliation.receipt_sha256.as_str())||entry.source_block_closure_sha256.as_deref()!=Some(bundle.source_block_closure_sha256.as_str()){bail!("PERSISTED_SLOT_INVENTORY_BINDING_INVALID")}let closure=SourceBlockClosure::read(root,slot)?;if closure.closure_sha256!=bundle.source_block_closure_sha256{bail!("PERSISTED_SLOT_SOURCE_CLOSURE_HASH_MISMATCH")}let expected=bundle.identities.iter().map(|identity|ExpectedIdentity{slot:identity.slot.clone(),signature:identity.signature.clone(),transaction_index:identity.transaction_index.clone()}).collect::<Vec<_>>();closure.validate_against_finalized(&bundle.reconciliation.source_instance_id,&bundle.reconciliation.continuity_epoch,&bundle.reconciliation.relevance_policy_sha256,slot,&bundle.reconciliation.block_identity,&expected)?;bundles.push(bundle) } }
     seal_forward_cohort_from_bundles(cohort_id,boundary_slot,inventory,&bundles)
 }
 /// The production receipt-only entry point. The consumer never accepts an
@@ -30,6 +30,8 @@ pub fn seal_forward_cohort_from_persisted_receipts(root:&Path,cohort_id:&str,bou
 /// producer's persisted inventory and its retained `getBlocks` proof bytes.
 pub fn seal_forward_cohort_from_persisted_receipt_chain(root:&Path,cohort_id:&str,boundary_slot:u64)->Result<ForwardCohortLedger>{
     let inventory=FinalizedSlotInventory::read_verified(root)?;
+    let run=CaptureRunJournal::load(root)?;
+    if run.checkpoint.lifecycle!=CaptureLifecycle::VerifiedDiagnostic || run.checkpoint.receipt_state!="COMMITTED" || run.checkpoint.finalized_inventory_sha256.as_deref()!=Some(inventory.inventory_sha256.as_str()) || run.checkpoint.source_instance_id!=inventory.source_instance_id || run.checkpoint.continuity_epoch!=inventory.continuity_epoch { bail!("FORWARD_CAPTURE_RUN_NOT_VERIFIED") }
     seal_forward_cohort_from_persisted_receipts(root,cohort_id,boundary_slot,&inventory)
 }
 pub fn seal_forward_cohort_from_bundles(cohort_id:&str,boundary_slot:u64,inventory:&FinalizedSlotInventory,bundles:&[SlotReceiptBundle])->Result<ForwardCohortLedger>{
@@ -57,9 +59,10 @@ mod tests {
             slot: "11".into(), finalized_blockhash: "block".into(),
             signature: "signature".into(), transaction_index: "0".into(),
             pool: String::new(), mint: String::new(), event_id: String::new(),
-            instruction_path: String::new(), identity_receipt_sha256: String::new(),
-            path_receipt_sha256: String::new(), witness: json!({}),
+            instruction_path: String::new(), identity_receipt_sha256: "a".repeat(64),
+            path_receipt_sha256: String::new(),
             disposition: "CREATION_QUARANTINED".into(), reason_code: Some("MALFORMED_WITNESS".into()),
+            witness: json!({"candidateKind":"PUMP_MIGRATE_CREATE_POOL","signature":"signature","transactionIndex":"0"}),
             receipt_sha256: String::new(),
         }.seal().unwrap();
         let mut pools = BTreeSet::new(); let mut decisions = BTreeSet::new(); let mut out = Vec::new();

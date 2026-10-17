@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::canonical_state_v1::hash_excluding_field;
 
-pub const FINALIZED_SLOT_INVENTORY_SCHEMA: &str = "EDGESNIFFER_FINALIZED_SLOT_INVENTORY_V1";
+pub const FINALIZED_SLOT_INVENTORY_SCHEMA_V1: &str = "EDGESNIFFER_FINALIZED_SLOT_INVENTORY_V1";
+pub const FINALIZED_SLOT_INVENTORY_SCHEMA: &str = "EDGESNIFFER_FINALIZED_SLOT_INVENTORY_V2";
 /// `getBlocks` consumes one request, leaving at most fifteen `getBlock`
 /// requests under the fixed sixteen-call diagnostic budget before any prior
 /// producer reconciliation calls are considered.
@@ -25,6 +26,9 @@ pub struct ReconciledProducedSlot {
     pub slot: String,
     pub block_identity: String,
     pub slot_reconciliation_receipt_sha256: String,
+    /// V2 binds the source-side filtered block closure into the inventory.
+    #[serde(default)]
+    pub source_block_closure_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -34,6 +38,8 @@ pub struct FinalizedSlotInventoryEntry {
     pub disposition: String,
     pub block_identity: Option<String>,
     pub slot_reconciliation_receipt_sha256: Option<String>,
+    #[serde(default)]
+    pub source_block_closure_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,7 +85,15 @@ impl FinalizedSlotInventory {
         if bytes != crate::canonical_state_v1::jcs_bytes(&serde_json::to_value(&output)?)? {
             bail!("SLOT_INVENTORY_SERIALIZATION_NONCANONICAL")
         }
-        let response = fs::read(root.join("finalized-getblocks-response.json"))?;
+        // Live runs retain the provider transport bytes before parsing. The
+        // synthetic fixture name is deliberately separate and can never be
+        // mistaken for live provider evidence.
+        let response_path = if root.join("raw-rpc-getBlocks-range.json").exists() {
+            root.join("raw-rpc-getBlocks-range.json")
+        } else {
+            root.join("synthetic-finalized-getblocks-response.json")
+        };
+        let response = fs::read(response_path)?;
         if crate::sha256_hex(&response) != output.get_blocks_response_sha256 {
             bail!("GET_BLOCKS_RESPONSE_PROOF_HASH_MISMATCH")
         }
@@ -115,9 +129,11 @@ impl FinalizedSlotInventory {
         let mut entries = Vec::with_capacity(count as usize);
         for slot in start_slot..=end_slot {
             if let Some(proof) = proofs.remove(&slot) {
-                entries.push(FinalizedSlotInventoryEntry { slot: slot.to_string(), disposition: "PRODUCED_RECONCILED".into(), block_identity: Some(proof.block_identity), slot_reconciliation_receipt_sha256: Some(proof.slot_reconciliation_receipt_sha256) });
+                let source_block_closure_sha256 = proof.source_block_closure_sha256.context("SLOT_INVENTORY_SOURCE_BLOCK_CLOSURE_MISSING")?;
+                digest(&source_block_closure_sha256, "SLOT_INVENTORY_SOURCE_BLOCK_CLOSURE_SHA256")?;
+                entries.push(FinalizedSlotInventoryEntry { slot: slot.to_string(), disposition: "PRODUCED_RECONCILED".into(), block_identity: Some(proof.block_identity), slot_reconciliation_receipt_sha256: Some(proof.slot_reconciliation_receipt_sha256), source_block_closure_sha256: Some(source_block_closure_sha256) });
             } else {
-                entries.push(FinalizedSlotInventoryEntry { slot: slot.to_string(), disposition: "FINALIZED_SKIPPED".into(), block_identity: None, slot_reconciliation_receipt_sha256: None });
+                entries.push(FinalizedSlotInventoryEntry { slot: slot.to_string(), disposition: "FINALIZED_SKIPPED".into(), block_identity: None, slot_reconciliation_receipt_sha256: None, source_block_closure_sha256: None });
             }
         }
         let mut output = Self { schema: FINALIZED_SLOT_INVENTORY_SCHEMA.into(), source_instance_id: source_instance_id.into(), continuity_epoch: continuity_epoch.into(), start_slot: start_slot.to_string(), end_slot: end_slot.to_string(), get_blocks_response_sha256: get_blocks_response_sha256.into(), entries, disposition: "FINALIZED_RANGE_COMPLETE".into(), reason_code: None, inventory_sha256: String::new() };
@@ -127,7 +143,7 @@ impl FinalizedSlotInventory {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema != FINALIZED_SLOT_INVENTORY_SCHEMA || self.source_instance_id.is_empty() || self.continuity_epoch.is_empty() { bail!("SLOT_INVENTORY_SCHEMA_OR_BINDING_INVALID") }
+        if self.schema != FINALIZED_SLOT_INVENTORY_SCHEMA && self.schema != FINALIZED_SLOT_INVENTORY_SCHEMA_V1 || self.source_instance_id.is_empty() || self.continuity_epoch.is_empty() { bail!("SLOT_INVENTORY_SCHEMA_OR_BINDING_INVALID") }
         digest(&self.get_blocks_response_sha256, "GET_BLOCKS_RESPONSE_SHA256")?;
         if self.inventory_sha256 != hash_excluding_field(self, "inventorySha256")? { bail!("SLOT_INVENTORY_HASH_INVALID") }
         let start = number(&self.start_slot, "SLOT_INVENTORY_START")?;
@@ -140,8 +156,11 @@ impl FinalizedSlotInventory {
                 "PRODUCED_RECONCILED" => {
                     if entry.block_identity.as_deref().unwrap_or_default().is_empty() { bail!("SLOT_INVENTORY_BLOCK_IDENTITY_MISSING") }
                     digest(entry.slot_reconciliation_receipt_sha256.as_deref().context("SLOT_INVENTORY_RECONCILIATION_RECEIPT_MISSING")?, "SLOT_RECONCILIATION_RECEIPT_SHA256")?;
+                    if self.schema == FINALIZED_SLOT_INVENTORY_SCHEMA {
+                        digest(entry.source_block_closure_sha256.as_deref().context("SLOT_INVENTORY_SOURCE_BLOCK_CLOSURE_MISSING")?, "SLOT_INVENTORY_SOURCE_BLOCK_CLOSURE_SHA256")?;
+                    }
                 }
-                "FINALIZED_SKIPPED" if entry.block_identity.is_none() && entry.slot_reconciliation_receipt_sha256.is_none() => {}
+                "FINALIZED_SKIPPED" if entry.block_identity.is_none() && entry.slot_reconciliation_receipt_sha256.is_none() && entry.source_block_closure_sha256.is_none() => {}
                 _ => bail!("SLOT_INVENTORY_ENTRY_INVALID"),
             }
         }
@@ -153,7 +172,7 @@ impl FinalizedSlotInventory {
 mod tests {
     use super::*;
     const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    fn proof(slot: u64) -> ReconciledProducedSlot { ReconciledProducedSlot { slot: slot.to_string(), block_identity: format!("block-{slot}"), slot_reconciliation_receipt_sha256: H.into() } }
+    fn proof(slot: u64) -> ReconciledProducedSlot { ReconciledProducedSlot { slot: slot.to_string(), block_identity: format!("block-{slot}"), slot_reconciliation_receipt_sha256: H.into(), source_block_closure_sha256: Some(H.into()) } }
     #[test]
     fn produced_and_finalized_skipped_slots_are_explicitly_bound() {
         let inventory = FinalizedSlotInventory::seal("source", "epoch", 10, 13, H, &[10, 12], vec![proof(10), proof(12)]).unwrap();

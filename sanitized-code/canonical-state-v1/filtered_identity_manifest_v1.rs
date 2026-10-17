@@ -12,7 +12,7 @@ use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::canonical_state_v1::{hash_excluding_field, jcs_bytes};
+use crate::{canonical_capture_run_v1::CanonicalRelevancePolicy, canonical_state_v1::{hash_excluding_field, jcs_bytes, sha256_hex}};
 
 pub const FILTERED_IDENTITY_SCHEMA: &str = "EDGESNIFFER_FILTERED_IDENTITY_MANIFEST_V1";
 pub const FILTERED_IDENTITY_CHECKPOINT_SCHEMA: &str = "EDGESNIFFER_FILTERED_IDENTITY_CHECKPOINT_V1";
@@ -223,6 +223,12 @@ impl FilteredIdentityManifestWriter {
         Ok(candidate)
     }
 
+    /// Durable cursor used by the run checkpoint. The journal itself remains
+    /// authoritative; a checkpoint can only resume after this tail is
+    /// independently revalidated by `open`.
+    pub fn tail_record_sha256(&self) -> &str { &self.tail }
+    pub fn next_manifest_sequence(&self) -> u64 { self.next_manifest_sequence }
+
     fn persist_checkpoint(&self) -> Result<()> {
         let checkpoint = ManifestCheckpoint { schema: FILTERED_IDENTITY_CHECKPOINT_SCHEMA.to_owned(), epoch_id: self.epoch_id.clone(), source_instance_id: self.source_instance_id.clone(), continuity_epoch: self.continuity_epoch.clone(), next_manifest_sequence: self.next_manifest_sequence.to_string(), next_receive_sequence: self.next_receive_sequence.to_string(), tail_record_sha256: self.tail.clone(), checkpoint_sha256: String::new() }.seal()?;
         let temporary = self.checkpoint_path.with_extension("tmp");
@@ -285,13 +291,42 @@ pub struct ReconciliationReceipt {
     pub block_identity: String,
     pub manifest_identity_count: String,
     pub block_relevant_identity_count: String,
+    /// Hash of the one frozen relevance policy used for subscription intent,
+    /// finalized derivation, receipt emission, and cohort validation.
+    pub relevance_policy_sha256: String,
+    /// SHA-256 of canonical sorted `(slot, signature, transaction_index)`.
+    /// This lets receipt consumers prove they received every expected identity,
+    /// rather than merely trusting matching counts.
+    pub expected_identity_set_sha256: String,
+    /// Exact SHA-256 of the immutable raw finalized `getBlock` response that
+    /// was parsed into this proof.  `None` is allowed only for synthetic
+    /// fixtures; retained live evidence must bind this field.
+    pub raw_provider_response_sha256: Option<String>,
     pub disposition: String,
     pub reason_code: Option<String>,
     pub receipt_sha256: String,
 }
 
+pub fn identity_set_digest(identities: &BTreeMap<(String, String), usize>) -> Result<String> {
+    let rows = identities.iter().map(|((slot, signature), index)| {
+        serde_json::json!({"slot":slot,"signature":signature,"transactionIndex":index.to_string()})
+    }).collect::<Vec<_>>();
+    Ok(sha256_hex(&jcs_bytes(&serde_json::Value::Array(rows))?))
+}
+
+pub fn relevance_policy_digest(canonical_program_ids: &BTreeSet<String>) -> Result<String> {
+    let programs = canonical_program_ids.iter().cloned().map(serde_json::Value::String).collect::<Vec<_>>();
+    Ok(sha256_hex(&jcs_bytes(&serde_json::json!({"schema":"EDGESNIFFER_CANONICAL_RELEVANCE_POLICY_V1","includeFailed":false,"includeVotes":false,"maxSupportedTransactionVersion":"1","programIds":programs,"policyVersion":"PUMPSWAP_FINALIZED_RELEVANCE_V1"}))?))
+}
+
 impl ReconciliationReceipt {
     fn seal(mut self) -> Result<Self> { self.receipt_sha256 = hash_excluding_field(&self, "receiptSha256")?; Ok(self) }
+    pub fn bind_raw_provider_response(mut self, raw_sha256: &str) -> Result<Self> {
+        if raw_sha256.len() != 64 { bail!("RAW_PROVIDER_RESPONSE_SHA_INVALID") }
+        self.raw_provider_response_sha256 = Some(raw_sha256.into());
+        self.receipt_sha256.clear();
+        self.seal()
+    }
 }
 
 /// A slot may receive at most one finalized identity.  A different identity
@@ -409,7 +444,12 @@ fn validate_manifest_chain(manifest: &[FilteredIdentity], source_instance_id: &s
     Ok(())
 }
 
-pub fn reconcile_finalized_block(epoch_id: &str, source_instance_id: &str, continuity_epoch: &str, block: FinalizedBlockInput, manifest: &[FilteredIdentity], canonical_program_ids: &BTreeSet<String>) -> Result<ReconciliationReceipt> {
+/// Reconcile against the one persisted policy object.  This is intentionally
+/// the production entry point: receipt emission and finality reconciliation
+/// must share one policy hash rather than independently reproducing a list of
+/// program ids and version semantics.
+pub fn reconcile_finalized_block_with_policy(epoch_id: &str, source_instance_id: &str, continuity_epoch: &str, block: FinalizedBlockInput, manifest: &[FilteredIdentity], policy: &CanonicalRelevancePolicy) -> Result<ReconciliationReceipt> {
+    policy.validate()?;
     if !block.finalized { bail!("BLOCK_NOT_FINALIZED") }
     let expected: usize = block.executed_transaction_count.parse().context("BLOCK_COUNT_INVALID")?;
     if block.transactions.len() != expected { bail!("BLOCK_INVENTORY_INCOMPLETE") }
@@ -418,8 +458,12 @@ pub fn reconcile_finalized_block(epoch_id: &str, source_instance_id: &str, conti
     for transaction in block.transactions {
         let index: usize = transaction.transaction_index.parse().context("BLOCK_TRANSACTION_INDEX_INVALID")?;
         if index >= expected || !seen_indexes.insert(index) || !seen_signatures.insert(transaction.signature.clone()) { bail!("BLOCK_ORDER_OR_IDENTITY_CONFLICT") }
-        transaction.require_supported_version()?;
-        if transaction.is_relevant_to(canonical_program_ids) {
+        // Transaction-version support is only a scientific obligation for a
+        // transaction matching the frozen Pump/PumpSwap program predicate.
+        // An unrelated future-version transaction must not poison a bounded
+        // filtered relevance proof.
+        if policy.matches_program_ids(&transaction)? {
+            transaction.require_supported_version()?;
             if block_relevant.insert((block.slot.clone(), transaction.signature), index).is_some() {
                 bail!("BLOCK_RELEVANT_DUPLICATE_IDENTITY")
             }
@@ -427,28 +471,39 @@ pub fn reconcile_finalized_block(epoch_id: &str, source_instance_id: &str, conti
     }
     if seen_indexes.len() != expected { bail!("BLOCK_INDEX_INVENTORY_INCOMPLETE") }
     validate_manifest_chain(manifest, source_instance_id, continuity_epoch)?;
-    let mut observed = BTreeMap::new();
+    // `SubscribeUpdateTransactionInfo.index` remains durable source telemetry,
+    // but it is not canonical Solana ordering. Finalized `getBlock` is the
+    // sole authority for transaction indexes and causal ordering. Comparing
+    // the provider field to a finalized block position caused R4 to reject
+    // four exact signature sets without evidence of a source gap.
+    let mut observed = BTreeSet::new();
     for identity in manifest.iter().filter(|identity| identity.slot == block.slot) {
-        let source_index = identity.source_transaction_index.as_deref()
-            .map(|value| value.parse::<usize>().context("FILTERED_SOURCE_TRANSACTION_INDEX_INVALID"))
-            .transpose()?;
-        if observed.insert((identity.slot.clone(), identity.signature.clone()), source_index).is_some() { bail!("MANIFEST_DUPLICATE_IDENTITY") }
+        if !observed.insert((identity.slot.clone(), identity.signature.clone())) { bail!("MANIFEST_DUPLICATE_IDENTITY") }
     }
     if observed.len() > MAX_IDENTITIES_PER_SLOT { bail!("MANIFEST_RECONCILIATION_MEMORY_CAP") }
-    let observed_identities: BTreeSet<_> = observed.keys().cloned().collect();
+    let observed_identities = observed;
     let block_identities: BTreeSet<_> = block_relevant.keys().cloned().collect();
     let (disposition, reason_code) = if observed_identities != block_identities {
         if observed_identities.is_subset(&block_identities) { ("REJECTED", Some("MISSING_FILTERED_IDENTITY".to_owned())) }
         else if block_identities.is_subset(&observed_identities) { ("REJECTED", Some("EXTRA_FILTERED_IDENTITY".to_owned())) }
         else { ("REJECTED", Some("FILTERED_IDENTITY_SET_CONFLICT".to_owned())) }
-    } else if observed.values().any(Option::is_none) {
-        ("REJECTED", Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISSING".to_owned()))
-    } else if observed.iter().any(|(identity, source_index)| block_relevant.get(identity) != source_index.as_ref()) {
-        ("REJECTED", Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISMATCH".to_owned()))
     } else {
         ("MATCHED", None)
     };
-    Ok(ReconciliationReceipt { schema: FINALIZED_RECONCILIATION_SCHEMA.to_owned(), epoch_id: epoch_id.to_owned(), source_instance_id: source_instance_id.to_owned(), continuity_epoch: continuity_epoch.to_owned(), slot: block.slot, block_identity: block.block_identity, manifest_identity_count: observed.len().to_string(), block_relevant_identity_count: block_relevant.len().to_string(), disposition: disposition.to_owned(), reason_code, receipt_sha256: String::new() }.seal()?)
+    let expected_identity_set_sha256 = identity_set_digest(&block_relevant)?;
+    let relevance_policy_sha256 = policy.policy_sha256.clone();
+    Ok(ReconciliationReceipt { schema: FINALIZED_RECONCILIATION_SCHEMA.to_owned(), epoch_id: epoch_id.to_owned(), source_instance_id: source_instance_id.to_owned(), continuity_epoch: continuity_epoch.to_owned(), slot: block.slot, block_identity: block.block_identity, manifest_identity_count: observed_identities.len().to_string(), block_relevant_identity_count: block_relevant.len().to_string(), relevance_policy_sha256, expected_identity_set_sha256, raw_provider_response_sha256: None, disposition: disposition.to_owned(), reason_code, receipt_sha256: String::new() }.seal()?)
+}
+
+/// Compatibility wrapper retained for existing offline callers.  Production
+/// capture uses `reconcile_finalized_block_with_policy` above.
+pub fn reconcile_finalized_block(epoch_id: &str, source_instance_id: &str, continuity_epoch: &str, block: FinalizedBlockInput, manifest: &[FilteredIdentity], canonical_program_ids: &BTreeSet<String>) -> Result<ReconciliationReceipt> {
+    let policy = CanonicalRelevancePolicy::new(
+        "PUMPSWAP_FINALIZED_RELEVANCE_V1",
+        canonical_program_ids.iter().cloned().collect(),
+        1,
+    )?;
+    reconcile_finalized_block_with_policy(epoch_id, source_instance_id, continuity_epoch, block, manifest, &policy)
 }
 
 #[cfg(test)]
@@ -482,21 +537,21 @@ mod tests {
     }
 
     #[test]
-    fn source_transaction_index_mismatch_fails_closed() {
+    fn source_transaction_index_mismatch_is_not_canonical_order() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
         out.append(10, "sig-10-0", 1, Some(3), "raw").unwrap();
         let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
-        assert_eq!(receipt.disposition, "REJECTED");
-        assert_eq!(receipt.reason_code.as_deref(), Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISMATCH"));
+        assert_eq!(receipt.disposition, "MATCHED");
+        assert_eq!(receipt.reason_code, None);
     }
 
     #[test]
-    fn missing_source_transaction_index_fails_closed_after_identity_membership_checks() {
+    fn missing_source_transaction_index_is_permitted_for_identity_reconciliation() {
         let root = tempdir().unwrap(); let mut out = writer(root.path());
         out.append(10, "sig-10-0", 1, None, "raw").unwrap();
         let receipt = reconcile_finalized_block("epoch-a", "source-a", "7", block(10, &["sig-10-0"]), &all_records(root.path()), &programs()).unwrap();
-        assert_eq!(receipt.disposition, "REJECTED");
-        assert_eq!(receipt.reason_code.as_deref(), Some("FILTERED_SOURCE_TRANSACTION_INDEX_MISSING"));
+        assert_eq!(receipt.disposition, "MATCHED");
+        assert_eq!(receipt.reason_code, None);
     }
 
     #[test]
